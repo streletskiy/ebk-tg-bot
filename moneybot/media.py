@@ -36,6 +36,7 @@ class Media:
             raise UserInputError("Выписка должна быть не больше 15 МБ.")
         raw = self.directory / f"{job_id}.{fmt}"
         process = None
+        keep_source = False
         try:
             progress("Скачиваю банковскую выписку")
             await self.telegram.download(document["file_id"], raw)
@@ -51,12 +52,16 @@ class Media:
             result = json.loads(output)
             if "error" in result:
                 raise UserInputError(result["error"])
+            result["source_file"] = {"file_id": document["file_id"], "format": fmt}
+            result["source_path"] = str(raw)
+            keep_source = True
             return result
         finally:
             if process and process.returncode is None:
                 process.kill()
                 await process.wait()
-            raw.unlink(missing_ok=True)
+            if not keep_source:
+                raw.unlink(missing_ok=True)
 
     async def extract(self, message, job_id, progress=None):
         text = message.get("text") or message.get("caption") or ""

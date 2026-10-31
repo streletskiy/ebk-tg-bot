@@ -146,11 +146,13 @@ def parse_table(path, fmt, tz):
 
 def noise(line):
     key = re.sub(r"\s", "", line).lower()
-    return (not key or key in {"операции", "мск", "дата", "обработки", "договора", "списания",
+    return (not key or re.match(r"^(?:БИК|ИНН|КПП)\b", line, re.I) is not None
+            or key in {"операции", "мск", "дата", "обработки", "договора", "списания",
             "картасуммаввалюте", "суммаввалюте", "номеркарты", "валютеоперации", "валютекарты"}
             or any(part in key for part in ("описаниеоперациидатаивремя", "датаивремядата", "универсальнаялицензия",
                   "банкароссии", "продолжениенаследующейстранице", "страница", "входящийостаток",
-                  "исходящийостаток", "всегорасходных", "всегоприходных")))
+                  "исходящийостаток", "всегорасходных", "всегоприходных",
+                  "операциисписанияоперацииввалютекарты")))
 
 
 def parse_yandex(text, tz):
@@ -213,6 +215,9 @@ def parse_tbank(text, tz):
         if re.match(rf"^{DATE}", line) and pending and len(MONEY_RE.findall(" ".join(pending))) >= 2:
             blocks.append(" ".join(pending))
             pending = []
+        if re.match(rf"^{DATE}", line) and len(MONEY_RE.findall(line)) == 2:
+            # The card column ends the first physical line, not the wrapped description.
+            line = re.sub(r"\s+\*?\d{4}\s*$", "", line)
         if pending or re.match(rf"^{DATE}", line):
             pending.append(line)
     if pending:
@@ -271,7 +276,21 @@ def parse_pdf(path, tz):
         try:
             rows = parser(variant, tz)
             if rows:
-                return bank, rows
+                verification = {"pages": len(reader.pages), "totals_verified": False}
+                if bank == "tbank":
+                    expected = len(re.findall(rf"^\s*{DATE}\s+{DATE}\b", text, re.M))
+                    if expected and expected != len(rows):
+                        raise StatementError("Количество строк PDF не совпало с разбором. Импорт остановлен.")
+                    totals = [re.search(label + r"\s*:\s*" + AMOUNT, text, re.I)
+                              for label in ("Пополнения", "Расходы")]
+                    if all(totals):
+                        for kind, total in zip(("income", "expense"), totals):
+                            code = currency(total[2])
+                            if (any(r["currency"] != code for r in rows)
+                                    or sum(r["amount"] for r in rows if r["kind"] == kind) != amount(total[1])):
+                                raise StatementError("Суммы строк не совпали с итогами PDF. Импорт остановлен.")
+                        verification["totals_verified"] = True
+                return bank, rows, verification
         except StatementError as exc:
             failure = exc
     raise failure or StatementError("В PDF не найдено распознаваемых строк операций.")
@@ -283,14 +302,15 @@ def parse_file(path, fmt, timezone):
     if path.stat().st_size > 15 * 1024 * 1024:
         raise StatementError("Выписка должна быть не больше 15 МБ.")
     if fmt == "pdf":
-        bank, rows = parse_pdf(path, tz)
+        bank, rows, verification = parse_pdf(path, tz)
     elif fmt in ("csv", "xlsx"):
         bank, rows = "tbank", parse_table(path, fmt, tz)
+        verification = {"totals_verified": False}
     else:
         raise StatementError("Поддерживаются PDF, CSV и XLSX.")
     if not rows or len(rows) > MAX_ROWS:
         raise StatementError(f"Выписка должна содержать от 1 до {MAX_ROWS} распознанных операций.")
-    return {"bank": bank, "format": fmt, "rows": rows}
+    return {"bank": bank, "format": fmt, "rows": rows, "parser_version": 2, "verification": verification}
 
 
 def main():

@@ -12,6 +12,7 @@ from .codex import Codex, CodexError
 from .ezbookkeeping import EzBookkeeping, EzError, UncertainWrite, UserInputError
 from .feedback import Feedback
 from .imports import StatementImports
+from .import_ui import StatementUI
 from .media import Media
 from .memory import active_rules, apply_changes
 from .models import Decision, money
@@ -64,7 +65,7 @@ action=memory для изменения правил без финансовой
 
 HELP = """Пришлите покупку текстом, фотографию чека или голосовое.
 Выписки: PDF Яндекс Банка и Т-Банка, CSV/XLSX Т-Банка.
-Для выписки выберите счёт; после двойной проверки ChatGPT подтвердите план.
+Выписку разбираю автоматически. Если нужен выбор, предложу кнопки; готовый план подтвердите одним нажатием.
 Дубли не добавляются, уточнение времени существующих записей — по подтверждённому плану.
 /import — текущая выписка; /import_page N — строки; /import_skip N — исключить.
 Например: «Кофе 250 рублей», «Вчера получил зарплату 80000».
@@ -88,6 +89,7 @@ class Service:
         self.ez = EzBookkeeping(settings, self.store)
         self.media = Media(settings, self.telegram)
         self.imports = StatementImports(self)
+        self.statement_ui = StatementUI(self)
         self.bot_id = 0
         self.stopping = asyncio.Event()
 
@@ -99,6 +101,7 @@ class Service:
         if webhook.get("url"):
             raise RuntimeError("Existing webhook detected; remove explicitly before polling")
         await self.codex.start()
+        self.store.resume_statements(self.s.contacts)
         log.info("started bot=%s contacts=%s", me["username"], len(self.s.contacts))
         tasks = [asyncio.create_task(self.poll()), asyncio.create_task(self.worker()),
                  asyncio.create_task(self.deliver()), asyncio.create_task(self.maintenance())]
@@ -121,9 +124,9 @@ class Service:
             try:
                 self.s.reload_contacts()
                 updates = await self.telegram.call("getUpdates", offset=int(self.store.meta("offset")),
-                                                   timeout=30, limit=50, allowed_updates=["message"])
+                                                   timeout=30, limit=50, allowed_updates=["message", "callback_query"])
                 self.accept_pairing(updates)
-                self.store.ingest(updates, self.s.contacts)
+                self.store.ingest(updates, self.s.contacts, self.bot_id)
                 self.store.set_meta("poll_heartbeat", time.time())
             except TelegramError as exc:
                 log.warning("poll %s", str(exc))
@@ -212,11 +215,28 @@ class Service:
         saved = self.store.meta(plan_key, "")
         if saved:
             return await self.apply_plan(job, json.loads(saved))
+        if "_callback" in message:
+            if message["_callback"] == "login":
+                return await self.command(user, "/login")
+            if message["_callback"] == "retry" and message.get("_retry_job"):
+                self.store.retry_job(user, message["_retry_job"])
+                self.store.disable_feedback(job["id"])
+                return "Повторяю обработку."
+            return await self.statement_ui.callback(job, message["_callback"])
+        if "_resume_statement" in message:
+            statement = (self.store.context(user) or {}).get("statement")
+            if not statement or statement["token"] != message["_resume_statement"]:
+                return "Этот импорт уже закрыт."
+            return await self.statement_ui.start(job, statement)
         if text.startswith("/"):
             progress("Выполняю команду")
             if text.split()[0].split("@")[0].lower() in (
                     "/import", "/import_account", "/import_confirm", "/import_page", "/import_category", "/import_skip"):
-                return await self.imports.command(job, text)
+                if text.split()[0].split("@")[0].lower() == "/import":
+                    return await self.statement_ui.start(job, self.imports.current(user))
+                result = await self.imports.command(job, text)
+                statement = (self.store.context(user) or {}).get("statement")
+                return self.statement_ui.view(statement) if statement else result
             return await self.command(user, text)
         # Freeze the model's plan before any write; retries must not reinterpret a partly applied receipt.
         progress("Загружаю счета и категории из ezBookkeeping")
@@ -224,7 +244,7 @@ class Service:
         if self.media.statement_format(message):
             return await self.imports.receive(job, message, catalog)
         if (self.store.context(user) or {}).get("statement"):
-            return "Сейчас открыта выписка: /import — проверка, /cancel — отменить. Затем можно прислать отдельную покупку."
+            return await self.statement_ui.text(job, text)
         text, images = await self.media.extract(message, job["id"], progress=progress)
         context = self.store.context(user)
         previous_images = context.get("images", []) if context else []

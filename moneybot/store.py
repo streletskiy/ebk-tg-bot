@@ -4,6 +4,8 @@ import time
 import psycopg
 from psycopg.rows import dict_row
 
+from .telegram import Reply
+
 
 class Store:
     LOCK_ID = 5570758412811194196
@@ -39,11 +41,16 @@ class Store:
     def set_meta(self, key, value):
         self.db.execute("INSERT INTO meta VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (key, str(value)))
 
-    def ingest(self, updates, contacts):
+    def ingest(self, updates, contacts, bot_id=0):
         with self.transaction():
             for update in updates:
                 uid = update["update_id"]
                 msg = update.get("message", {})
+                callback = update.get("callback_query")
+                if callback:
+                    self.ingest_callback(uid, callback, contacts, bot_id)
+                    self.set_meta("offset", uid + 1)
+                    continue
                 sender = msg.get("from", {})
                 user = sender.get("id")
                 # Ignore edited messages, bots, groups, channels and all unknown users before persistence.
@@ -65,7 +72,60 @@ class Store:
             return row
 
     def finish(self, job, response):
-        self.db.execute("UPDATE jobs SET status='done',response=%s,payload='{}',error=NULL,notified=feedback_disabled,progress=NULL WHERE id=%s", (response, job))
+        markup = json.dumps(response.markup, ensure_ascii=False) if isinstance(response, Reply) else "{}"
+        text = response.text if isinstance(response, Reply) else response
+        self.db.execute("UPDATE jobs SET status='done',response=%s,reply_markup=%s,payload='{}',error=NULL,notified=feedback_disabled,progress=NULL WHERE id=%s", (text, markup, job))
+
+    def ingest_callback(self, uid, callback, contacts, bot_id):
+        sender, msg = callback.get("from", {}), callback.get("message", {})
+        user, data = sender.get("id"), callback.get("data", "")
+        if (type(user) is not int or user not in contacts or sender.get("is_bot")
+                or msg.get("chat", {}).get("type") != "private" or msg["chat"]["id"] != user
+                or msg.get("from", {}).get("id") != bot_id or not isinstance(data, str)
+                or not 1 <= len(data.encode()) <= 64 or not isinstance(callback.get("id"), str)):
+            return
+        previous = self.db.execute("""SELECT f.*,j.id AS owner FROM job_feedback f JOIN jobs j ON j.id=f.job_id
+            WHERE j.user_id=%s AND f.message_id=%s ORDER BY j.created DESC,j.id DESC LIMIT 1""",
+            (user, msg.get("message_id"))).fetchone()
+        if not previous:
+            return
+        markup = json.loads(previous["sent_markup"] or '{}')
+        allowed = {b.get("callback_data") for row in markup.get("inline_keyboard", []) for b in row}
+        payload = {"_callback": data if data in allowed else "stale", "message_id": msg["message_id"]}
+        if data == "retry" and data in allowed:
+            payload["_retry_job"] = previous["owner"]
+        inserted = self.db.execute("""INSERT INTO jobs(id,user_id,payload,created,source_message_id,callback_id)
+            VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING RETURNING id""",
+            (uid, user, json.dumps(payload), time.time(), msg["message_id"], callback["id"][:200])).fetchone()
+        if inserted:
+            # Only the latest queued action owns this interactive message. Financial jobs
+            # still finish in order, but an older dispatcher result cannot restore stale buttons.
+            self.db.execute("""UPDATE jobs SET feedback_disabled=1,notified=1 WHERE user_id=%s AND id<>%s
+                AND id IN (SELECT job_id FROM job_feedback WHERE message_id=%s)""", (user, uid, msg["message_id"]))
+            self.save_feedback(uid, 0, msg["message_id"], previous["sent_text"], previous["sent_markup"])
+
+    def pending_callbacks(self):
+        return self.db.execute("SELECT id,user_id,callback_id FROM jobs WHERE callback_id IS NOT NULL AND callback_answered=0 ORDER BY created LIMIT 20").fetchall()
+
+    def callback_answered(self, job):
+        self.db.execute("UPDATE jobs SET callback_answered=1 WHERE id=%s", (job,))
+
+    def resume_statements(self, contacts):
+        for record in self.db.execute("SELECT user_id,content FROM conversations WHERE updated>%s", (time.time()-86400,)).fetchall():
+            user = record["user_id"]
+            statement = json.loads(record["content"]).get("statement")
+            if user not in contacts or not statement or statement.get("ui_version") == 1:
+                continue
+            job = self.db.execute("""SELECT id,source_message_id FROM jobs WHERE user_id=%s AND status='done'
+                AND response LIKE %s AND NOT EXISTS(SELECT 1 FROM meta WHERE key='plan:' || jobs.id::text)
+                ORDER BY id DESC LIMIT 1""", (user, '%: прочитано ' + str(len(statement['rows'])) + ' операций.%')).fetchone()
+            if job:
+                statement["ui_version"] = 1
+                with self.transaction():
+                    self.save_context(user, {"statement": statement})
+                    self.db.execute("""UPDATE jobs SET status='queued',payload=%s,response=NULL,notified=0,
+                        feedback_disabled=0,next_attempt=0,attempts=0 WHERE id=%s""",
+                        (json.dumps({"_resume_statement": statement["token"]}), job["id"]))
 
     def fail(self, job, code, retry, response=None):
         self.db.execute("UPDATE jobs SET status=%s,error=%s,next_attempt=%s,response=%s,notified=feedback_disabled,progress=NULL WHERE id=%s",
@@ -95,8 +155,8 @@ class Store:
     def feedback_messages(self, job):
         return {row["part"]: dict(row) for row in self.db.execute("SELECT * FROM job_feedback WHERE job_id=%s", (job,))}
 
-    def save_feedback(self, job, part, message_id, text):
-        self.db.execute("INSERT INTO job_feedback VALUES(%s,%s,%s,%s) ON CONFLICT(job_id,part) DO UPDATE SET message_id=EXCLUDED.message_id,sent_text=EXCLUDED.sent_text", (job, part, message_id, text))
+    def save_feedback(self, job, part, message_id, text, markup="{}"):
+        self.db.execute("INSERT INTO job_feedback(job_id,part,message_id,sent_text,sent_markup) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(job_id,part) DO UPDATE SET message_id=EXCLUDED.message_id,sent_text=EXCLUDED.sent_text,sent_markup=EXCLUDED.sent_markup", (job, part, message_id, text, markup))
 
     def defer_feedback(self, job, until):
         self.db.execute("UPDATE jobs SET delivery_after=%s WHERE id=%s", (until, job))
@@ -112,8 +172,11 @@ class Store:
         row = self.db.execute("SELECT id FROM jobs WHERE user_id=%s AND status='failed' ORDER BY id DESC LIMIT 1", (user,)).fetchone()
         if not row:
             return False
+        return self.retry_job(user, row["id"])
+
+    def retry_job(self, user, job):
         self.db.execute("""UPDATE jobs SET status='queued',attempts=0,next_attempt=0,progress=NULL,response=NULL,
-            notified=0,feedback_disabled=0,delivery_after=0 WHERE id=%s""", (row["id"],))
+            reply_markup='{}',notified=0,feedback_disabled=0,delivery_after=0 WHERE id=%s AND user_id=%s AND status='failed'""", (job, user))
         return True
 
     def notified(self, job):
@@ -162,7 +225,8 @@ class Store:
         self.db.execute("UPDATE jobs SET response=NULL,payload='{}' WHERE created<%s AND notified=1", (cutoff,))
         self.db.execute("UPDATE writes SET payload='{}',result=NULL WHERE created<%s AND state='done'", (cutoff,))
         self.db.execute("DELETE FROM meta WHERE key IN (SELECT 'plan:' || id::text FROM jobs WHERE created<%s AND notified=1)", (cutoff,))
-        self.db.execute("UPDATE job_feedback SET sent_text='' WHERE job_id IN (SELECT id FROM jobs WHERE created<%s AND notified=1)", (cutoff,))
+        self.db.execute("UPDATE job_feedback SET sent_text='',sent_markup='{}' WHERE job_id IN (SELECT id FROM jobs WHERE created<%s AND notified=1)", (cutoff,))
+        self.db.execute("UPDATE jobs SET reply_markup='{}',callback_id=NULL WHERE created<%s AND notified=1", (cutoff,))
 
 
 SCHEMA = """
@@ -190,4 +254,8 @@ CREATE TABLE IF NOT EXISTS memories(
 CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(status,next_attempt,id);
 CREATE INDEX IF NOT EXISTS jobs_user_order ON jobs(user_id,status,id);
 CREATE INDEX IF NOT EXISTS jobs_feedback_due ON jobs(delivery_after,id) WHERE notified=0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reply_markup TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS callback_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS callback_answered INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE job_feedback ADD COLUMN IF NOT EXISTS sent_markup TEXT NOT NULL DEFAULT '{}';
 """
