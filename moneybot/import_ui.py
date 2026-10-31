@@ -26,6 +26,28 @@ class StatementUI:
     def control(statement, text, action, argument="", style=None):
         return button(text, f"s:{statement['token']}:{action}:{argument}", style)
 
+    def unresolved(self, statement):
+        return sorted((r for r in statement["rows"] if self.engine.decision(r)[0] == "review"), key=lambda r: r["number"])
+
+    def current_view(self, statement, notice=""):
+        number = statement.get("ui_row", 0)
+        if 1 <= number <= len(statement["rows"]) and statement.get("ui_catalog"):
+            return self.row_view(statement, statement["rows"][number-1], statement["ui_catalog"],
+                                 statement.get("ui_category_page", 0), notice)
+        return self.view(statement, statement.get("ui_page", 1), notice)
+
+    def open_row(self, job, statement, row, catalog, category_page=0, notice=""):
+        statement.update(ui_row=row["number"], ui_category_page=category_page)
+        self.engine.save(job["user_id"], statement)
+        return self.row_view(statement, row, catalog, category_page, notice)
+
+    def open_plan(self, job, statement, page=1, notice=""):
+        statement.pop("ui_row", None)
+        statement.pop("ui_category_page", None)
+        statement["ui_page"] = max(1, min(page, (len(statement["rows"])+self.PAGE_SIZE-1)//self.PAGE_SIZE))
+        self.engine.save(job["user_id"], statement)
+        return self.view(statement, statement["ui_page"], notice)
+
     def view(self, statement, page=1, notice=""):
         rows = statement["rows"]
         pages = max(1, (len(rows) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
@@ -65,7 +87,8 @@ class StatementUI:
             navigation.append(self.control(statement, "→", "page", str(page+1)))
         keyboard.append(navigation)
         if counts["review"]:
-            keyboard.append([self.control(statement, f"Разобрать спорные · {counts['review']}", "questions", style="primary")])
+            first = self.unresolved(statement)[0]["number"]
+            keyboard.append([self.control(statement, f"Разобрать спорные · {counts['review']} · с № {first}", "review", str(first), "primary")])
         if counts["new"] or counts["time"]:
             keyboard.append([self.control(statement, f"Подтвердить: добавить {counts['new']}, время {counts['time']}",
                                           "confirm", style="success")])
@@ -91,8 +114,8 @@ class StatementUI:
 
     async def start(self, job, statement, catalog=None):
         if statement.get("ready"):
-            return self.view(statement)
-        catalog = catalog or await self.svc.ez.catalog()
+            return self.current_view(statement)
+        catalog = catalog or await self.svc.ez.catalog(fresh=False)
         currencies = {r["currency"] for r in statement["rows"]}
         available = [a for a in catalog["accounts"] if a.get("type") != 2 and a["currency"] in currencies]
         contact = self.svc.s.contacts[job["user_id"]]
@@ -151,8 +174,25 @@ class StatementUI:
                 sections.append("\n".join(matches))
             sections.append(f"Категории · {page+1}/{max(1, (len(categories)+5)//6)}\n"
                             "★ — подходящие варианты в порядке рекомендации.\nВыберите кнопку или напишите пояснение.")
+        unresolved = self.unresolved(statement)
+        previous = next((r for r in reversed(unresolved) if r["number"] < row["number"]), None)
+        following = next((r for r in unresolved if r["number"] > row["number"]), None)
+        if action == "review":
+            position = next(i for i, r in enumerate(unresolved, 1) if r["number"] == row["number"])
+            sections.append(f"Спорная {position} из {len(unresolved)}\nПереходы идут по номерам строк выписки.")
+        elif unresolved:
+            sections.append(f"Осталось спорных: {len(unresolved)}")
+        if not following:
+            sections.append("Конец списка спорных строк\nДальше спорных операций нет. Вернуться к предыдущим можно кнопкой ниже.")
+        navigation = []
+        if previous:
+            navigation.append(self.control(statement, f"← Спорная № {previous['number']}", "review", str(previous["number"])))
+        if following:
+            navigation.append(self.control(statement, f"Следующая · № {following['number']} →", "review", str(following["number"])))
+        if navigation:
+            keyboard.append(navigation)
         keyboard += [[self.control(statement, "Пропустить эту строку", "skip", str(row["number"]))],
-                     [self.control(statement, "Следующая спорная", "questions"), self.control(statement, "К плану", "page", "1")]]
+                     [self.control(statement, "К плану", "page", str(statement.get("ui_page", (row["number"]-1)//self.PAGE_SIZE+1)))]]
         return card_reply(sections, keyboard)
 
     async def callback(self, job, data):
@@ -162,18 +202,16 @@ class StatementUI:
             return "Этот импорт уже завершён или отменён. Пришлите новую выписку."
         parts = data.split(":")
         if len(parts) != 4 or parts[0] != "s" or parts[1] != statement["token"]:
-            return self.view(statement, notice="План обновился. Используйте актуальные кнопки ниже.")
+            return self.current_view(statement, notice="План обновился. Используйте актуальные кнопки ниже.")
         action, argument = parts[2:]
         if action == "cancel":
             self.store.save_context(job["user_id"], None)
             return "Импорт отменён. Можно прислать другую выписку или отдельную покупку."
         if action == "page":
-            statement.pop("ui_row", None)
-            self.engine.save(job["user_id"], statement)
-            return self.view(statement, int(argument or 1))
+            return self.open_plan(job, statement, int(argument or 1))
         catalog = statement.get("ui_catalog")
         if not catalog or action in ("confirm", "account", "refresh"):
-            catalog = await self.svc.ez.catalog()
+            catalog = await self.svc.ez.catalog(fresh=action in ("confirm", "account", "refresh"))
             self.engine.cache_catalog(statement, catalog)
             self.engine.save(job["user_id"], statement)
         if action == "confirm":
@@ -191,12 +229,8 @@ class StatementUI:
             await self.engine.prepare(job, statement, account_id, catalog, refresh=True)
             return self.view(statement)
         if action == "questions":
-            unresolved = [r for r in statement["rows"] if self.engine.decision(r)[0] == "review"]
-            after = statement.get("ui_row", 0)
-            row = next((r for r in unresolved if r["number"] > after), unresolved[0] if unresolved else None)
-            if not row:
-                return self.view(statement, notice="Спорных строк больше нет.")
-        elif action in ("row", "categories", "category", "skip"):
+            return self.current_view(statement, notice="Навигация обновлена. Выберите кнопку с номером строки.")
+        elif action in ("row", "review", "categories", "category", "skip"):
             pieces = argument.split(",")
             if not pieces[0].isdigit() or not 1 <= int(pieces[0]) <= len(statement["rows"]):
                 raise UserInputError("Не удалось найти строку выписки.")
@@ -206,21 +240,23 @@ class StatementUI:
                     raise UserInputError("Не удалось определить категорию.")
                 self.engine.category(row, pieces[1], catalog)
                 if row.get("blocked"):
-                    return self.row_view(statement, row, catalog)
+                    return self.open_row(job, statement, row, catalog)
                 row.update(manual_category_id=pieces[1], category_name=self.engine.category(row, pieces[1], catalog)["name"], excluded=False)
                 statement["token"] = secrets.token_hex(4)
             elif action == "skip":
                 row["excluded"] = True
                 statement["token"] = secrets.token_hex(4)
-                self.engine.save(job["user_id"], statement)
-                return self.view(statement, (row["number"]-1)//self.PAGE_SIZE+1)
+                following = next((r for r in self.unresolved(statement) if r["number"] > row["number"]), None)
+                notice = f"Строка № {row['number']} пропущена."
+                if following:
+                    return self.open_row(job, statement, following, catalog, notice=notice)
+                return self.open_plan(job, statement, (row["number"]-1)//self.PAGE_SIZE+1,
+                                      notice + " Дальше спорных строк нет.")
             elif action == "categories":
-                return self.row_view(statement, row, catalog, int(pieces[1]))
+                return self.open_row(job, statement, row, catalog, int(pieces[1]))
         else:
-            return self.view(statement)
-        statement["ui_row"] = row["number"]
-        self.engine.save(job["user_id"], statement)
-        return self.row_view(statement, row, catalog)
+            return self.current_view(statement)
+        return self.open_row(job, statement, row, catalog)
 
     async def text(self, job, text):
         statement = self.engine.current(job["user_id"])

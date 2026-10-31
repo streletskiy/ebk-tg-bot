@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import json
 import time
@@ -12,7 +13,7 @@ class Feedback:
 
     def __init__(self, settings, store, telegram):
         self.s, self.store, self.telegram = settings, store, telegram
-        self.chat_ready = {}
+        self.chat_budget = {}
         self.rate_limit_until = 0
 
     @staticmethod
@@ -32,16 +33,29 @@ class Feedback:
         return [f"🕓 Запрос принят\n\nПозиция в очереди: {entry['position']} из {entry['total']}\n\n{detail}"]
 
     async def tick(self):
-        now = time.time()
-        for callback in self.store.pending_callbacks():
+        callbacks = asyncio.create_task(self.answer_callbacks())
+        try:
+            return await self.deliver_result()
+        finally:
+            await callbacks
+
+    async def answer_callbacks(self):
+        semaphore = asyncio.Semaphore(4)
+
+        async def answer(callback):
             try:
                 if callback["user_id"] in self.s.contacts:
-                    await self.telegram.call("answerCallbackQuery", callback_query_id=callback["callback_id"])
+                    async with semaphore:
+                        await self.telegram.call("answerCallbackQuery", callback_query_id=callback["callback_id"])
             except TelegramError as exc:
                 if str(exc) != "TELEGRAM_400":
-                    self.rate_limit_until = time.time() + max(exc.retry_after, 5)
-                    return False
+                    self.rate_limit_until = max(self.rate_limit_until, time.time() + max(exc.retry_after, 5))
+                    return
             self.store.callback_answered(callback["id"])
+        await asyncio.gather(*(answer(c) for c in self.store.pending_callbacks()))
+
+    async def deliver_result(self):
+        now = time.time()
         if now < self.rate_limit_until:
             return False
         queue = self.store.active_queue()
@@ -50,7 +64,10 @@ class Feedback:
             if user not in self.s.contacts:
                 self.store.disable_feedback(job["id"])
                 continue
-            if now < self.chat_ready.get(user, 0):
+            credit, updated = self.chat_budget.get(user, (2, now))
+            credit = min(2, credit + max(0, now-updated)/1.05)
+            self.chat_budget[user] = (credit, now)
+            if credit < 1:
                 continue
             desired = self.desired(job, queue)
             if not desired and job["status"] not in ("done", "failed"):
@@ -89,9 +106,10 @@ class Feedback:
                 if not message_id:
                     message_id = await self.telegram.send_text(user, text,
                         job["source_message_id"] if part == 0 else sent[0]["message_id"], json.loads(markups[part]), entities[part])
-                self.store.save_feedback(job["id"], part, message_id, text, markups[part], encoded_entities[part])
+                self.store.record_delivery(job["id"], part, message_id, text, markups[part], encoded_entities[part])
                 self.store.defer_feedback(job["id"], time.time() + 2)
-                self.chat_ready[user] = time.time() + 1.05
+                # Permit a short two-click burst, then sustain at most one edit/second.
+                self.chat_budget[user] = (credit-1, time.time())
                 # Each chunk has a persistent ID, so retrying a long response reuses delivered parts.
                 if job["status"] in ("done", "failed") and part == len(desired) - 1:
                     self.store.feedback_complete(job["id"], job["response"])

@@ -105,7 +105,8 @@ class Service:
         self.store.refresh_statement_menus(self.s.contacts)
         log.info("started bot=%s contacts=%s", me["username"], len(self.s.contacts))
         tasks = [asyncio.create_task(self.poll()), asyncio.create_task(self.worker()),
-                 asyncio.create_task(self.deliver()), asyncio.create_task(self.maintenance())]
+                 asyncio.create_task(self.deliver()), asyncio.create_task(self.maintenance()),
+                 asyncio.create_task(self.warm_catalog())]
         stopper = asyncio.create_task(self.stopping.wait())
         try:
             done, _ = await asyncio.wait([*tasks, stopper], return_when=asyncio.FIRST_COMPLETED)
@@ -241,13 +242,11 @@ class Service:
             statement = (self.store.context(user) or {}).get("statement")
             if not statement or statement["token"] != message["_refresh_statement_ui"]:
                 return "Этот импорт уже закрыт."
-            catalog = await self.ez.catalog()
+            catalog = await self.ez.catalog(fresh=False)
             self.imports.cache_catalog(statement, catalog)
             await self.imports.suggest_categories(job, statement, catalog)
             self.imports.save(user, statement)
-            if statement.get("ui_row"):
-                return self.statement_ui.row_view(statement, statement["rows"][statement["ui_row"]-1], catalog)
-            return self.statement_ui.view(statement)
+            return self.statement_ui.current_view(statement)
         if text.startswith("/"):
             progress("Выполняю команду")
             if text.split()[0].split("@")[0].lower() in (
@@ -438,3 +437,11 @@ class Service:
             self.media.cleanup()
             self.store.set_meta("heartbeat", time.time())
             await asyncio.sleep(30)
+
+    async def warm_catalog(self):
+        while True:
+            try:
+                await self.ez.warm_catalog()
+            except EzError as exc:
+                log.warning("catalog_refresh error=%s", str(exc))
+            await asyncio.sleep(self.ez.CATALOG_TTL)

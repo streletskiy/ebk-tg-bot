@@ -105,6 +105,16 @@ class Store:
             VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING RETURNING id""",
             (uid, user, json.dumps(payload), time.time(), msg["message_id"], callback["id"][:200])).fetchone()
         if inserted:
+            # Superseded navigation has no financial side effects. Keep every mutation
+            # and every callback acknowledgement, but render only the latest destination.
+            self.db.execute("""UPDATE jobs SET status='done',response='',payload='{}',progress=NULL
+                WHERE user_id=%s AND id<%s AND status='queued'
+                AND id IN (SELECT job_id FROM job_feedback WHERE message_id=%s)
+                AND (payload::jsonb->>'_callback') ~ '^s:[^:]+:(page|row|review|categories|accounts|questions):'
+                AND NOT EXISTS(SELECT 1 FROM jobs barrier WHERE barrier.user_id=jobs.user_id
+                    AND barrier.id>jobs.id AND barrier.id<%s AND barrier.status IN ('queued','processing')
+                    AND COALESCE(barrier.payload::jsonb->>'_callback','') !~ '^s:[^:]+:(page|row|review|categories|accounts|questions):')
+                AND NOT EXISTS(SELECT 1 FROM meta WHERE key='plan:' || jobs.id::text)""", (user, uid, msg["message_id"], uid))
             # Only the latest queued action owns this interactive message. Financial jobs
             # still finish in order, but an older dispatcher result cannot restore stale buttons.
             self.db.execute("""UPDATE jobs SET feedback_disabled=1,notified=1 WHERE user_id=%s AND id<>%s
@@ -143,7 +153,7 @@ class Store:
         for record in self.db.execute("SELECT user_id,content FROM conversations WHERE updated>%s", (time.time()-86400,)).fetchall():
             user = record["user_id"]
             statement = json.loads(record["content"]).get("statement")
-            if user not in contacts or not statement or not statement.get("ready") or statement.get("ui_version", 0) >= 2:
+            if user not in contacts or not statement or not statement.get("ready") or statement.get("ui_version", 0) >= 3:
                 continue
             job = self.db.execute("""SELECT id FROM jobs WHERE user_id=%s AND status='done' AND reply_markup LIKE %s
                 AND EXISTS(SELECT 1 FROM job_feedback WHERE job_id=jobs.id)
@@ -152,7 +162,7 @@ class Store:
             if not job:
                 continue
             with self.transaction():
-                statement["ui_version"] = 2
+                statement["ui_version"] = 3
                 self.save_context(user, {"statement": statement})
                 self.db.execute("""UPDATE jobs SET status='queued',payload=%s,response=NULL,notified=0,
                     feedback_disabled=0,next_attempt=0,attempts=0,progress=NULL,delivery_after=0 WHERE id=%s""",
@@ -188,6 +198,15 @@ class Store:
 
     def has_feedback(self):
         return self.db.execute("SELECT EXISTS(SELECT 1 FROM jobs WHERE feedback_disabled=0 AND notified=0) AS pending").fetchone()["pending"]
+
+    def record_delivery(self, job, part, message_id, text, markup, entities):
+        self.save_feedback(job, part, message_id, text, markup, entities)
+        # A click can arrive while editMessageText is in flight. Its new owner must
+        # inherit what Telegram actually displayed, rather than a pre-edit snapshot.
+        self.db.execute("""UPDATE job_feedback SET sent_text=%s,sent_markup=%s,sent_entities=%s
+            WHERE part=%s AND job_id=(SELECT j.id FROM jobs j JOIN job_feedback f ON f.job_id=j.id
+                WHERE j.user_id=(SELECT user_id FROM jobs WHERE id=%s) AND f.message_id=%s
+                ORDER BY j.created DESC,j.id DESC LIMIT 1)""", (text, markup, entities, part, job, message_id))
 
     def defer_feedback(self, job, until):
         self.db.execute("UPDATE jobs SET delivery_after=%s WHERE id=%s", (until, job))

@@ -114,7 +114,7 @@ class StatementImports:
         statement = await self.svc.media.statement(message, job["id"],
             lambda text: self.store.progress(job["id"], text))
         statement["token"] = secrets.token_hex(4)
-        statement.update(ui_version=2, origin_job=job["id"])
+        statement.update(ui_version=3, origin_job=job["id"])
         counts = Counter()
         for index, row in enumerate(statement["rows"], 1):
             counts[row["fingerprint"]] += 1

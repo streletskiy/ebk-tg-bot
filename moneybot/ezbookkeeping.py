@@ -1,4 +1,8 @@
+import asyncio
+import copy
+import hashlib
 import json
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -35,9 +39,16 @@ def leaves(items, child_key, parent=""):
 
 
 class EzBookkeeping:
+    CATALOG_TTL = 300
+    CATALOG_MAX_AGE = 86400
+
     def __init__(self, settings, store):
         self.s, self.store = settings, store
         self.http = httpx.AsyncClient(timeout=30, follow_redirects=False)
+        self._catalog = None
+        self._catalog_at = 0
+        self._catalog_scope = None
+        self._catalog_lock = asyncio.Lock()
 
     async def call(self, path, *, params=None, body=None):
         try:
@@ -55,11 +66,46 @@ class EzBookkeeping:
         except (httpx.HTTPError, ValueError) as exc:
             raise EzError("EZ_REQUEST_FAILED") from exc
 
-    async def catalog(self):
-        accounts = await self.call("accounts/list.json")
-        categories = await self.call("transaction/categories/list.json")
-        return {"accounts": leaves(accounts, "subAccounts"),
-                "categories": leaves(categories, "subCategories")}
+    def load_catalog_cache(self):
+        scope = hashlib.sha256((self.s.ez_url + "\0" + self.s.ez_token()).encode()).hexdigest()
+        if self._catalog_scope != scope:
+            self._catalog_scope, self._catalog, self._catalog_at = scope, None, 0
+            if self.store:
+                try:
+                    cached = json.loads(self.store.meta("catalog_cache", "{}"))
+                    if cached.get("scope") == scope and 0 <= time.time()-cached["saved_at"] < self.CATALOG_MAX_AGE:
+                        self._catalog, self._catalog_at = cached["value"], cached["saved_at"]
+                except (ValueError, KeyError, TypeError):
+                    pass
+
+    async def catalog(self, *, fresh=True):
+        """Menu reads may use cache; financial callers retain a mandatory fresh read."""
+        self.load_catalog_cache()
+        requested = time.time()
+        if not fresh and self._catalog is not None and requested-self._catalog_at < self.CATALOG_MAX_AGE:
+            return copy.deepcopy(self._catalog)
+        async with self._catalog_lock:
+            # Coalesce concurrent requests that were already satisfied while waiting.
+            if self._catalog is not None and self._catalog_at >= requested:
+                return copy.deepcopy(self._catalog)
+            scope = self._catalog_scope
+            accounts, categories = await asyncio.gather(self.call("accounts/list.json"),
+                                                       self.call("transaction/categories/list.json"))
+            self.load_catalog_cache()
+            if scope != self._catalog_scope:
+                raise EzError("EZ_CATALOG_SCOPE_CHANGED")
+            catalog = {"accounts": leaves(accounts, "subAccounts"), "categories": leaves(categories, "subCategories")}
+            saved_at = time.time()
+            if self.store:
+                self.store.set_meta("catalog_cache", json.dumps({"scope": self._catalog_scope,
+                    "saved_at": saved_at, "value": catalog}, ensure_ascii=False))
+            self._catalog, self._catalog_at = catalog, saved_at
+            return copy.deepcopy(catalog)
+
+    async def warm_catalog(self):
+        self.load_catalog_cache()
+        if self._catalog is None or time.time()-self._catalog_at >= self.CATALOG_TTL:
+            await self.catalog()
 
     @staticmethod
     def model_catalog(catalog):
