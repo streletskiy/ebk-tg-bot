@@ -156,7 +156,7 @@ class EzBookkeeping:
                 "sourceAmount": row["sourceAmount"], "destinationAccountId": "0",
                 "destinationAmount": 0, "hideAmount": row.get("hideAmount", False), "comment": row.get("comment", ""),
                 "tagIds": row.get("tagIds", [identifier(t) for t in row.get("tags", [])]),
-                "pictureIds": [identifier(p) for p in row.get("pictures", [])],
+                "pictureIds": [str(p["pictureId"]) for p in row.get("pictures", [])],
                 "geoLocation": row.get("geoLocation")}
 
     async def update_time_once(self, marker, job_id, before, after):

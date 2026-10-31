@@ -34,7 +34,7 @@ docker compose up -d
 Данные PostgreSQL сохраняются в Docker volume; OAuth и настройки — в `.local/data`.
 
 Образы: `ghcr.io/streletskiy/ebk-tg-bot:dev` — каждый коммит dev;
-`:0.3.0` и `:latest` — опубликованные стабильные релизы. Поддерживаются amd64 и arm64.
+`:0.3.1` и `:latest` — опубликованные стабильные релизы. Поддерживаются amd64 и arm64.
 
 При переходе со старой SQLite остановите бота, сохраните резервную копию и выполните
 `docker compose run --rm bot migrate-sqlite --sqlite-path /data/moneybot.sqlite3`
