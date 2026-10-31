@@ -43,7 +43,7 @@ class Decision(StrictModel):
     entries: list[Entry] = Field(max_length=10)
     query: Query | None
     message: str = Field(max_length=3000)
-    memory_changes: list[MemoryChange] = Field(default_factory=list, max_length=10)
+    memory_changes: list[MemoryChange] = Field(max_length=10)
 
 
 def cents(value: str) -> int:
