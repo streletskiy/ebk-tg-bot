@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.local/
+.data/
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+*.log
+*.db*
+*.sqlite*
+.DS_Store

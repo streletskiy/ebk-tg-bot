@@ -1,0 +1,10 @@
+{
+  "owner_id": 123456789,
+  "contacts": {
+    "123456789": {
+      "name": "Владелец",
+      "default_account_id": "",
+      "currency": "RUB"
+    }
+  }
+}

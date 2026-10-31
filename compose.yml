@@ -1,0 +1,62 @@
+name: ebk-tg-bot
+services:
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ebk_tg_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-ebk_tg_bot}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+  bot:
+    image: ${BOT_IMAGE:-ghcr.io/streletskiy/ebk-tg-bot:latest}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      CONTACTS_FILE: /data/contacts.json
+      CODEX_HOME: /data/codex
+      EZBOOKKEEPING_TOKEN_FILE: /data/ezbookkeeping.token
+      HF_HOME: /data/models
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-ebk_tg_bot}
+      PGUSER: ${POSTGRES_USER:-ebk_tg_bot}
+      PGPASSWORD_FILE: /data/postgres.password
+      HTTP_PROXY: ${MONEYBOT_HTTP_PROXY:-}
+      HTTPS_PROXY: ${MONEYBOT_HTTPS_PROXY:-}
+      NO_PROXY: ${MONEYBOT_NO_PROXY:-localhost,127.0.0.1,db}
+    volumes:
+      - ./.local/data:/data
+    extra_hosts: [host.docker.internal:host-gateway]
+    read_only: true
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 3g
+    cpus: 4
+    pids_limit: 256
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+volumes:
+  postgres_data:
+secrets:
+  postgres_password:
+    file: ./.local/data/postgres.password

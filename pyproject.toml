@@ -1,0 +1,24 @@
+[project]
+name = "ebk-tg-bot"
+version = "0.2.0"
+license = "MIT"
+description = "Private Telegram bookkeeping assistant with Codex OAuth and ezBookkeeping"
+requires-python = ">=3.12"
+dependencies = ["httpx==0.28.1", "pydantic==2.12.3", "Pillow==12.0.0", "tzdata==2025.2", "psycopg[binary]==3.3.6"]
+
+[project.optional-dependencies]
+voice = ["faster-whisper==1.2.1"]
+
+[project.scripts]
+moneybot = "moneybot.cli:main"
+
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["moneybot*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
