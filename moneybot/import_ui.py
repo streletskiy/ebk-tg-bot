@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import datetime
 
 from .ezbookkeeping import UserInputError
+from .statements import transfer_details
 from .telegram import Reply, button, card_reply
 
 
@@ -14,6 +15,18 @@ def clean(value, limit=180):
 
 def amount(value):
     return f"{value // 100:,}".replace(",", " ") + f",{value % 100:02d}"
+
+
+def transfer_summary(statement, row):
+    details = row.get("transfer") or transfer_details(row["description"], statement["bank"], row["kind"])
+    if not details:
+        return ""
+    party = "Получатель" if row["kind"] == "expense" else "Отправитель"
+    lines = [f"{party}: {clean(details.get('party') or 'не указан в выписке')}",
+             f"Банк: {clean(details.get('bank') or 'не указан в выписке')}"]
+    if details.get("reference"):
+        lines.append(clean(details["reference"]))
+    return "\n".join(lines)
 
 
 class StatementUI:
@@ -77,6 +90,7 @@ class StatementUI:
             dt = datetime.fromisoformat(row["occurred_at"])
             lines.append(f"№ {row['number']} · {'−' if row['kind']=='expense' else '+'}{amount(row['amount'])} {row['currency']}\n"
                          f"{dt:%d.%m.%Y · %H:%M} · {label}\n{clean(row['description'])}"
+                         + ("\n" + details if (details := transfer_summary(statement, row)) else "")
                          + ("\nКатегория: " + clean(row["category_name"], 100) if row.get("category_name") and action == "new" else ""))
             keyboard.append([self.control(statement, f"{row['number']}. {row['description'][:45]}", "row", str(row["number"]))])
         navigation = []
@@ -138,16 +152,19 @@ class StatementUI:
         label = {"new": "Готово к добавлению", "time": "Уточнить время", "skip": "Будет пропущено", "review": "Нужно ваше решение"}[action]
         sections = [notice, f"Операция № {row['number']} из {len(statement['rows'])}\n{dt:%d.%m.%Y · %H:%M:%S}",
                     f"{'−' if row['kind']=='expense' else '+'}{amount(row['amount'])} {row['currency']}\n{clean(row['description'])}",
+                    transfer_summary(statement, row),
                     f"{label}\n{clean(reason, 300)}"]
         if row.get("manual_category_id"):
             selected = next((c["name"] for c in catalog["categories"] if c["id"] == row["manual_category_id"]), "")
             if selected:
                 sections.append("Выбрано вами\n" + clean(selected, 140))
+        elif row.get("rule_category_id"):
+            sections.append("Ваше правило\n" + clean(row["rule_merchant"], 100) + " → " + clean(row.get("category_name", ""), 140))
         keyboard = []
         if not row.get("blocked"):
             categories = [c for c in catalog["categories"] if c["type"] == (2 if row["kind"] == "expense" else 1)
                           and str(c.get("parentId", "0")) != "0"]
-            suggested = [row.get("manual_category_id"), *row.get("category_suggestions", [])]
+            suggested = [row.get("manual_category_id"), row.get("rule_category_id"), *row.get("category_suggestions", [])]
             for phase in ("review", "proposal"):
                 choice = row.get(phase, {})
                 suggested += [choice.get("category_id"), *choice.get("suggested_category_ids", [])]

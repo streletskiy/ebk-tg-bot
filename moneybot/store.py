@@ -153,7 +153,7 @@ class Store:
         for record in self.db.execute("SELECT user_id,content FROM conversations WHERE updated>%s", (time.time()-86400,)).fetchall():
             user = record["user_id"]
             statement = json.loads(record["content"]).get("statement")
-            if user not in contacts or not statement or not statement.get("ready") or statement.get("ui_version", 0) >= 3:
+            if user not in contacts or not statement or not statement.get("ready") or statement.get("ui_version", 0) >= 4:
                 continue
             job = self.db.execute("""SELECT id FROM jobs WHERE user_id=%s AND status='done' AND reply_markup LIKE %s
                 AND EXISTS(SELECT 1 FROM job_feedback WHERE job_id=jobs.id)
@@ -162,7 +162,7 @@ class Store:
             if not job:
                 continue
             with self.transaction():
-                statement["ui_version"] = 3
+                statement["ui_version"] = 4
                 self.save_context(user, {"statement": statement})
                 self.db.execute("""UPDATE jobs SET status='queued',payload=%s,response=NULL,notified=0,
                     feedback_disabled=0,next_attempt=0,attempts=0,progress=NULL,delivery_after=0 WHERE id=%s""",

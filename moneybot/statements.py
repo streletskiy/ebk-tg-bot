@@ -57,6 +57,46 @@ def redact(text):
     return text[:180]
 
 
+def transfer_details(description, bank, kind, fields=None):
+    """Extract only stated counterparties; retain masked references, never raw numbers."""
+    text = clean(description)[:2000]
+    fields = fields or {}
+    incoming = kind == "income"
+    party_key = "Отправитель" if incoming else "Получатель"
+    bank_key = "Банк отправителя" if incoming else "Банк получателя"
+    party, destination = fields.get(party_key, ""), fields.get(bank_key, "")
+    if not re.search(r"\bперевод\b", text, re.I) and not (party or destination):
+        return {}
+    labels = r"отправитель|от кого" if incoming else r"получатель|кому"
+    boundary = r"(?=\s*[,;]\s*(?:банк|получатель|отправитель|кому|от кого|сч[её]т|телефон)\b|$)"
+    named = re.search(rf"(?:{labels})\s*:\s*(.+?){boundary}", text, re.I)
+    named_bank = re.search(rf"банк(?:\s+(?:получателя|отправителя))?\s*:\s*(.+?){boundary}", text, re.I)
+    if not party and named:
+        party = named[1]
+    if not destination and named_bank:
+        destination = named_bank[1]
+    if re.fullmatch(r"Перевод себе[.]?", text, re.I):
+        party = "Себе"
+    account_bank = re.search(r"сч[её]т\s+(?:\[реквизиты\]|[\d *-]{5,})\s*,\s*(.+)$", text, re.I)
+    if not destination and account_bank:
+        destination = account_bank[1]
+    if not destination and bank == "tbank" and re.match(r"(?:Внутренний перевод|Перевод с договора)\b", text, re.I):
+        destination = "Т-Банк (внутренний перевод)"
+    reference = ""
+    for label, pattern in (
+        ("Телефон", r"(?:номеру телефона|телефон)\s*:?\s*(\+?[\d(][\d ()*-]{7,}\d)"),
+        ("Договор", r"договор(?:а)?\s*:?\s*([\d*][\d *-]{4,}\d)"),
+        ("Счёт", r"сч[её]т(?:а)?\s*:?\s*([\d*][\d *-]{4,}\d)"),
+    ):
+        match = re.search(pattern, text, re.I)
+        if match:
+            digits = re.sub(r"\D", "", match[1])
+            if len(digits) >= 4:
+                reference = label + " ••" + digits[-4:]
+                break
+    return {"party": redact(party), "bank": redact(destination), "reference": reference}
+
+
 def row(bank, date, value, curr, description, tz, *, status="", precise=True):
     try:
         dt = datetime.strptime(clean(date), "%d.%m.%Y %H:%M:%S" if len(clean(date)) == 19 else
@@ -66,6 +106,7 @@ def row(bank, date, value, curr, description, tz, *, status="", precise=True):
     if dt.year < 1970 or dt.timestamp() > datetime.now(tz).timestamp() + 86400:
         raise StatementError("В выписке некорректная или будущая дата операции.")
     signed = amount(value)
+    transfer = transfer_details(description, bank, "expense" if signed < 0 else "income")
     description = redact(description)
     if not description:
         raise StatementError("В выписке есть операция без описания.")
@@ -74,7 +115,8 @@ def row(bank, date, value, curr, description, tz, *, status="", precise=True):
     return {"occurred_at": dt.isoformat(), "amount": abs(signed), "currency": curr,
             "kind": "expense" if signed < 0 else "income", "description": description,
             "fingerprint": hashlib.sha256(identity.encode()).hexdigest(), "precise": precise,
-            "source_skip": status or ("Нулевая сумма" if not signed else "")}
+            "source_skip": status or ("Нулевая сумма" if not signed else ""),
+            **({"transfer": transfer} if transfer else {})}
 
 
 def tabular(rows, tz):
@@ -99,6 +141,9 @@ def tabular(rows, tz):
         parsed = row("tbank", date, value, curr, data.get("Описание", ""), tz,
                      status=skipped, precise=":" in date)
         parsed.update(bank_category=redact(data.get("Категория", "")), mcc=data.get("MCC", "")[:4])
+        transfer = transfer_details(data.get("Описание", ""), "tbank", parsed["kind"], data)
+        if transfer:
+            parsed["transfer"] = transfer
         result.append(parsed)
     return result
 
@@ -310,7 +355,7 @@ def parse_file(path, fmt, timezone):
         raise StatementError("Поддерживаются PDF, CSV и XLSX.")
     if not rows or len(rows) > MAX_ROWS:
         raise StatementError(f"Выписка должна содержать от 1 до {MAX_ROWS} распознанных операций.")
-    return {"bank": bank, "format": fmt, "rows": rows, "parser_version": 2, "verification": verification}
+    return {"bank": bank, "format": fmt, "rows": rows, "parser_version": 3, "verification": verification}
 
 
 def main():

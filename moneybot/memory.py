@@ -1,5 +1,6 @@
 """Bounded, user-scoped category preferences; never arbitrary model instructions."""
 
+import re
 import unicodedata
 
 from .ezbookkeeping import UserInputError
@@ -18,6 +19,14 @@ def active_rules(store, user, catalog):
             result.append({"merchant": rule["merchant"], "kind": rule["kind"],
                            "category_id": rule["category_id"], "category_name": category["name"]})
     return result
+
+
+def matching_rules(description, kind, rules):
+    """Match whole merchant words; conflicting explicit preferences stay unresolved."""
+    words = " " + " ".join(re.findall(r"\w+", normalize(description))) + " "
+    return [r for r in rules if r["kind"] == kind
+            and (merchant := " ".join(re.findall(r"\w+", normalize(r["merchant"]))))
+            and " " + merchant + " " in words]
 
 
 def apply_changes(store, user, changes, catalog, source):

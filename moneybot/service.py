@@ -244,6 +244,7 @@ class Service:
                 return "Этот импорт уже закрыт."
             catalog = await self.ez.catalog(fresh=False)
             self.imports.cache_catalog(statement, catalog)
+            self.imports.apply_category_rules(user, statement, catalog)
             await self.imports.suggest_categories(job, statement, catalog)
             self.imports.save(user, statement)
             return self.statement_ui.current_view(statement)
