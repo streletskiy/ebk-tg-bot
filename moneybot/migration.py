@@ -55,7 +55,7 @@ def migrate_sqlite(settings, filename):
                 return {"status": "already_imported", "sha256": fingerprint}
             if imported:
                 raise ValueError("A different legacy database was already imported")
-            for table in TABLE_KEYS:
+            for table in (*TABLE_KEYS, "memories"):
                 if target.db.execute(sql.SQL("SELECT EXISTS(SELECT 1 FROM {}) AS present").format(sql.Identifier(table))).fetchone()["present"]:
                     raise ValueError("PostgreSQL target must be empty; no data was overwritten")
             for table, (columns, rows, digest) in tables.items():
