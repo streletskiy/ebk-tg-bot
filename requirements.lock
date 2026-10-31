@@ -6,6 +6,7 @@ certifi==2026.10.23
 click==8.5.0
 ctranslate2==4.8.4
 faster-whisper==1.2.1
+et_xmlfile==2.0.0
 filelock==4.2.5
 flatbuffers==25.12.19
 fsspec==2026.9.0
@@ -19,6 +20,7 @@ huggingface_hub==2.4.0
 idna==3.20
 numpy==2.5.4
 onnxruntime==1.31.1
+openpyxl==3.1.5
 packaging==26.3
 pillow==12.0.0
 protobuf==7.36.2
@@ -26,6 +28,7 @@ psycopg==3.3.6
 psycopg-binary==3.3.6
 pydantic==2.12.3
 pydantic_core==2.41.4
+pypdf==6.21.4
 PyYAML==6.0.3
 tokenizers==0.23.3
 tqdm==4.70.1

@@ -117,6 +117,70 @@ class EzBookkeeping:
         self.store.write_result(marker, result)
         return result
 
+    async def statement_history(self, account_id, start, end):
+        params = {"count": 50, "min_time": start * 1000, "max_time": end * 1000,
+                  "account_ids": account_id, "with_count": "true"}
+        rows, seen, cursors = [], set(), set()
+        while True:
+            page = await self.call("transactions/list.json", params=params)
+            if page.get("totalCount", 0) > self.s.max_rows:
+                raise UserInputError("Слишком много записей для сверки. Пришлите выписку за меньший период.")
+            for item in page.get("items", []):
+                if item["id"] not in seen:
+                    seen.add(item["id"])
+                    rows.append(item)
+            if len(rows) > self.s.max_rows:
+                raise UserInputError("Слишком много записей для сверки. Сократите период выписки.")
+            cursor = page.get("nextTimeSequenceId")
+            if not cursor:
+                return rows
+            if cursor in cursors or not page.get("items"):
+                raise EzError("EZ_PAGINATION_STALLED")
+            cursors.add(cursor)
+            params["max_time"] = cursor
+
+    async def transaction_detail(self, transaction_id):
+        return await self.call("transactions/get.json", params={"id": transaction_id,
+            "with_pictures": "true", "trim_account": "false", "trim_category": "false", "trim_tag": "false"})
+
+    @staticmethod
+    def editable_transaction(row):
+        def identifier(value):
+            return str(value.get("id", "")) if isinstance(value, dict) else str(value or "")
+        if row.get("type") not in (2, 3) or row.get("editable") is False:
+            raise UserInputError("Нельзя изменять время этой операции.")
+        return {"id": str(row["id"]), "type": row["type"], "time": row["time"],
+                "utcOffset": row.get("utcOffset", 0),
+                "categoryId": identifier(row.get("categoryId") or row.get("category")),
+                "sourceAccountId": identifier(row.get("sourceAccountId") or row.get("sourceAccount")),
+                "sourceAmount": row["sourceAmount"], "destinationAccountId": "0",
+                "destinationAmount": 0, "hideAmount": row.get("hideAmount", False), "comment": row.get("comment", ""),
+                "tagIds": row.get("tagIds", [identifier(t) for t in row.get("tags", [])]),
+                "pictureIds": [identifier(p) for p in row.get("pictures", [])],
+                "geoLocation": row.get("geoLocation")}
+
+    async def update_time_once(self, marker, job_id, before, after):
+        previous = self.store.write(marker)
+        if previous and previous["state"] == "done":
+            return json.loads(previous["result"] or '{}')
+        current = await self.transaction_detail(after["id"])
+        snapshot = self.editable_transaction(current)
+        if previous:
+            # A lost modification response is reconciled by ID and the complete expected state.
+            if snapshot == after:
+                self.store.write_result(marker, current)
+                return current
+            raise UncertainWrite("EZ_WRITE_UNCERTAIN")
+        if snapshot != before:
+            raise UserInputError("Запись изменилась после предпросмотра. Импорт остановлен; нужна новая сверка.")
+        self.store.prepare(marker, job_id, {"before": before, "after": after})
+        try:
+            result = await self.call("transactions/modify.json", body=after)
+        except EzError:
+            return await self.update_time_once(marker, job_id, before, after)
+        self.store.write_result(marker, result)
+        return result
+
     async def report(self, query, catalog, progress=None):
         if progress:
             progress("Получаю данные для отчёта из ezBookkeeping")

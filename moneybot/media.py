@@ -1,5 +1,7 @@
 import asyncio
 import os
+import json
+import sys
 import time
 
 from PIL import Image, ImageOps
@@ -16,6 +18,46 @@ class Media:
         self.directory.mkdir(exist_ok=True)
         self.whisper = None
 
+    @staticmethod
+    def statement_format(message):
+        document = message.get("document", {})
+        name = document.get("file_name", "").lower()
+        for extension in ("pdf", "csv", "xlsx"):
+            if name.endswith("." + extension):
+                return extension
+        return {"application/pdf": "pdf", "text/csv": "csv",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx"}.get(
+                    document.get("mime_type"))
+
+    async def statement(self, message, job_id, progress):
+        fmt = self.statement_format(message)
+        document = message["document"]
+        if document.get("file_size", 0) > min(self.s.max_media, 15 * 1024 * 1024):
+            raise UserInputError("Выписка должна быть не больше 15 МБ.")
+        raw = self.directory / f"{job_id}.{fmt}"
+        process = None
+        try:
+            progress("Скачиваю банковскую выписку")
+            await self.telegram.download(document["file_id"], raw)
+            progress("Читаю строки банковской выписки")
+            process = await asyncio.create_subprocess_exec(sys.executable, "-m", "moneybot.statements",
+                str(raw), fmt, str(self.s.timezone), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            try:
+                output, _ = await asyncio.wait_for(process.communicate(), 45)
+            except TimeoutError:
+                raise UserInputError("Разбор выписки занял слишком долго. Пришлите выписку за меньший период.") from None
+            if process.returncode or len(output) > 4_000_000:
+                raise UserInputError("Не удалось прочитать выписку: слишком сложный или повреждённый файл.")
+            result = json.loads(output)
+            if "error" in result:
+                raise UserInputError(result["error"])
+            return result
+        finally:
+            if process and process.returncode is None:
+                process.kill()
+                await process.wait()
+            raw.unlink(missing_ok=True)
+
     async def extract(self, message, job_id, progress=None):
         text = message.get("text") or message.get("caption") or ""
         if len(text) > 12000:
@@ -31,7 +73,7 @@ class Media:
             media = message["document"]
             kind = "image" if media.get("mime_type", "").startswith("image/") else None
         if media and kind is None:
-            raise UserInputError("Пришлите текст, фотографию/изображение или голосовое сообщение.")
+            raise UserInputError("Пришлите текст, изображение, голосовое или банковскую выписку PDF/CSV/XLSX.")
         if media:
             if media.get("file_size", 0) > self.s.max_media:
                 raise UserInputError(f"Размер файла должен быть не больше {self.s.max_media//1024//1024} МБ.")

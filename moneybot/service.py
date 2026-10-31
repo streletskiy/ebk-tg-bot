@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from .codex import Codex, CodexError
 from .ezbookkeeping import EzBookkeeping, EzError, UncertainWrite, UserInputError
 from .feedback import Feedback
+from .imports import StatementImports
 from .media import Media
 from .memory import active_rules, apply_changes
 from .models import Decision, money
@@ -62,6 +63,10 @@ action=memory для изменения правил без финансовой
 """
 
 HELP = """Пришлите покупку текстом, фотографию чека или голосовое.
+Выписки: PDF Яндекс Банка и Т-Банка, CSV/XLSX Т-Банка.
+Для выписки выберите счёт; после двойной проверки ChatGPT подтвердите план.
+Дубли не добавляются, уточнение времени существующих записей — по подтверждённому плану.
+/import — текущая выписка; /import_page N — строки; /import_skip N — исключить.
 Например: «Кофе 250 рублей», «Вчера получил зарплату 80000».
 Спросите: «Расходы за октябрь», «Сколько ушло на продукты?», «Остатки на счетах».
 Понятные покупки и доходы записываю сразу. Если данных мало — уточняю.
@@ -82,6 +87,7 @@ class Service:
         self.codex = Codex(settings)
         self.ez = EzBookkeeping(settings, self.store)
         self.media = Media(settings, self.telegram)
+        self.imports = StatementImports(self)
         self.bot_id = 0
         self.stopping = asyncio.Event()
 
@@ -201,17 +207,24 @@ class Service:
         user = job["user_id"]
         message = json.loads(job["payload"])
         text = message.get("text", "")
-        if text.startswith("/"):
-            progress("Выполняю команду")
-            return await self.command(user, text)
-        # Freeze the model's plan before any write; retries must not reinterpret a partly applied receipt.
+        # Confirmed import commands also resume their frozen plan before command dispatch.
         plan_key = "plan:" + str(job["id"])
         saved = self.store.meta(plan_key, "")
+        if saved:
+            return await self.apply_plan(job, json.loads(saved))
+        if text.startswith("/"):
+            progress("Выполняю команду")
+            if text.split()[0].split("@")[0].lower() in (
+                    "/import", "/import_account", "/import_confirm", "/import_page", "/import_category", "/import_skip"):
+                return await self.imports.command(job, text)
+            return await self.command(user, text)
+        # Freeze the model's plan before any write; retries must not reinterpret a partly applied receipt.
         progress("Загружаю счета и категории из ezBookkeeping")
         catalog = await self.ez.catalog()
-        if saved:
-            plan = json.loads(saved)
-            return await self.apply_plan(job, plan)
+        if self.media.statement_format(message):
+            return await self.imports.receive(job, message, catalog)
+        if (self.store.context(user) or {}).get("statement"):
+            return "Сейчас открыта выписка: /import — проверка, /cancel — отменить. Затем можно прислать отдельную покупку."
         text, images = await self.media.extract(message, job["id"], progress=progress)
         context = self.store.context(user)
         previous_images = context.get("images", []) if context else []
@@ -276,10 +289,12 @@ class Service:
     async def apply_plan(self, job, plan):
         self.store.save_context(job["user_id"], None)
         memory_response = plan.get("memory_response", "") if isinstance(plan, dict) else ""
+        statement = isinstance(plan, dict) and plan.get("statement")
         plan = plan["entries"] if isinstance(plan, dict) else plan
         if not plan:
             return memory_response
         lines = []
+        updated = 0
         for index, item in enumerate(plan, 1):
             self.s.reload_contacts()
             if job["user_id"] not in self.s.contacts:
@@ -288,10 +303,18 @@ class Service:
             previous = self.store.write(item["marker"])
             action = "Сверяю результат записи" if previous else "Сохраняю запись"
             self.store.progress(job["id"], f"{action} {index} из {len(plan)} в ezBookkeeping")
+            if item.get("operation") == "time":
+                await self.ez.update_time_once(item["marker"], job["id"], item["before"], item["after"])
+                updated += 1
+                continue
             result = await self.ez.create_once(item["marker"], job["id"], payload)
             kind = "Расход" if payload["type"] == 3 else "Доход"
             description = payload["comment"].split("\n[moneybot:", 1)[0]
             lines.append(f"{kind}: {money(payload['sourceAmount'])} {item['currency']}\n{description}\nСчёт: {item['account']} · {item['category']}\nЗапись: {result.get('id', 'сохранена')}")
+        if statement:
+            return (f"Импорт завершён. Добавлено: {len(plan) - updated}; уточнено время: {updated}.\n"
+                    "Категории, комментарии и вложения существующих записей сохранены.\n"
+                    "Проверьте результат в ezBookkeeping или запросите отчёт в боте.")
         return "Записано в ezBookkeeping:\n\n" + "\n\n".join(lines) + ("\n\n" + memory_response if memory_response else "")
 
     async def command(self, user, text):
@@ -332,8 +355,8 @@ class Service:
         if cmd in ("/accounts", "/categories", "/balance"):
             catalog = await self.ez.catalog()
             if cmd == "/categories":
-                return "Категории:\n" + "\n".join(f"{'Доход' if c['type']==1 else 'Расход' if c['type']==2 else 'Перевод'}: {c['name']}" for c in catalog["categories"])
-            return "Счета:\n" + "\n".join(f"{a['name']}: {money(a['balance'])} {a['currency']}" for a in catalog["accounts"])
+                return "Категории:\n" + "\n".join(f"{c['id']} · {'Доход' if c['type']==1 else 'Расход' if c['type']==2 else 'Перевод'}: {c['name']}" for c in catalog["categories"])
+            return "Счета:\n" + "\n".join(f"{a['id']} · {a['name']}: {money(a['balance'])} {a['currency']}" for a in catalog["accounts"])
         if cmd in ("/allow", "/deny"):
             if user != self.s.owner:
                 return "Управление доступом разрешено только владельцу."
