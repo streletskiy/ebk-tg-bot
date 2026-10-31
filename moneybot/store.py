@@ -133,6 +133,21 @@ class Store:
     def write(self, marker):
         return self.db.execute("SELECT * FROM writes WHERE marker=%s", (marker,)).fetchone()
 
+    def memories(self, user):
+        return self.db.execute("SELECT id,kind,merchant,category_id,category_name FROM memories WHERE user_id=%s ORDER BY id", (user,)).fetchall()
+
+    def remember(self, user, kind, merchant, category_id, category_name):
+        self.db.execute("""INSERT INTO memories(user_id,kind,merchant,category_id,category_name,updated)
+            VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(user_id,kind,merchant) DO UPDATE
+            SET category_id=EXCLUDED.category_id,category_name=EXCLUDED.category_name,updated=EXCLUDED.updated""",
+            (user, kind, merchant, category_id, category_name, time.time()))
+
+    def forget(self, user, rule_id):
+        return self.db.execute("DELETE FROM memories WHERE user_id=%s AND id=%s RETURNING id", (user, rule_id)).fetchone() is not None
+
+    def forget_merchant(self, user, kind, merchant):
+        self.db.execute("DELETE FROM memories WHERE user_id=%s AND kind=%s AND merchant=%s", (user, kind, merchant))
+
     def prepare(self, marker, job, payload):
         self.db.execute("INSERT INTO writes VALUES(%s,%s,%s,'sending',NULL,%s)",
                         (marker, job, json.dumps(payload, ensure_ascii=False), time.time()))
@@ -167,6 +182,11 @@ CREATE TABLE IF NOT EXISTS conversations(
 CREATE TABLE IF NOT EXISTS job_feedback(
     job_id BIGINT NOT NULL, part INTEGER NOT NULL, message_id BIGINT NOT NULL,
     sent_text TEXT NOT NULL, PRIMARY KEY(job_id,part));
+CREATE TABLE IF NOT EXISTS memories(
+    id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('expense','income')), merchant TEXT NOT NULL,
+    category_id TEXT NOT NULL, category_name TEXT NOT NULL, updated DOUBLE PRECISION NOT NULL,
+    UNIQUE(user_id,kind,merchant));
 CREATE INDEX IF NOT EXISTS jobs_pending ON jobs(status,next_attempt,id);
 CREATE INDEX IF NOT EXISTS jobs_user_order ON jobs(user_id,status,id);
 CREATE INDEX IF NOT EXISTS jobs_feedback_due ON jobs(delivery_after,id) WHERE notified=0;

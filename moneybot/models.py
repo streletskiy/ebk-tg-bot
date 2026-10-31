@@ -30,11 +30,20 @@ class Query(StrictModel):
     group_by: Literal["category", "month", "day", "account", "merchant"]
 
 
+class MemoryChange(StrictModel):
+    operation: Literal["remember", "forget"]
+    kind: Literal["expense", "income"]
+    merchant: str = Field(min_length=2, max_length=100)
+    category_id: str
+    evidence: str = Field(min_length=3, max_length=1000)
+
+
 class Decision(StrictModel):
-    action: Literal["record", "query", "clarify", "help"]
+    action: Literal["record", "query", "clarify", "help", "memory"]
     entries: list[Entry] = Field(max_length=10)
     query: Query | None
     message: str = Field(max_length=3000)
+    memory_changes: list[MemoryChange] = Field(default_factory=list, max_length=10)
 
 
 def cents(value: str) -> int:
