@@ -2,7 +2,7 @@ import logging
 import json
 import time
 
-from .telegram import TelegramError, message_chunks
+from .telegram import TelegramError, chunk_entities, message_chunks
 
 log = logging.getLogger("moneybot")
 
@@ -19,6 +19,8 @@ class Feedback:
     def desired(job, queue):
         if job["status"] in ("done", "failed"):
             return message_chunks(job["response"] or "")
+        if job.get("callback_id") and not job.get("progress"):
+            return []
         if job["status"] == "processing":
             return ["⏳ Обрабатываю запрос\n\nСейчас: " + (job["progress"] or "Начинаю обработку")]
         entry = queue.get(job["id"], {"position": 1, "total": 1, "ready_at": 0})
@@ -51,6 +53,10 @@ class Feedback:
             if now < self.chat_ready.get(user, 0):
                 continue
             desired = self.desired(job, queue)
+            if not desired and job["status"] not in ("done", "failed"):
+                continue
+            entities = chunk_entities(json.loads(job.get("reply_entities") or '[]') if job["status"] == "done" else [], desired)
+            encoded_entities = [json.dumps(e, sort_keys=True) for e in entities]
             markup = json.loads(job.get("reply_markup") or '{}') if job["status"] == "done" else {}
             if job["status"] == "failed":
                 action = "login" if job.get("error") == "CODEX_LOGIN_REQUIRED" and user == self.s.owner else "retry"
@@ -62,7 +68,8 @@ class Feedback:
             sent = self.store.feedback_messages(job["id"])
             pending = next(((part, text) for part, text in enumerate(desired)
                             if part not in sent or sent[part]["sent_text"] != text
-                            or sent[part].get("sent_markup", "{}") != markups[part]), None)
+                            or sent[part].get("sent_markup", "{}") != markups[part]
+                            or sent[part].get("sent_entities", "[]") != encoded_entities[part]), None)
             if pending is None:
                 if job["status"] in ("done", "failed"):
                     self.store.feedback_complete(job["id"], job["response"])
@@ -74,20 +81,22 @@ class Feedback:
             try:
                 if message_id:
                     try:
-                        await self.telegram.edit_text(user, message_id, text, json.loads(markups[part]))
+                        await self.telegram.edit_text(user, message_id, text, json.loads(markups[part]), entities[part])
                     except TelegramError as exc:
                         if not exc.message_missing:
                             raise
                         message_id = None
                 if not message_id:
                     message_id = await self.telegram.send_text(user, text,
-                        job["source_message_id"] if part == 0 else sent[0]["message_id"], json.loads(markups[part]))
-                self.store.save_feedback(job["id"], part, message_id, text, markups[part])
+                        job["source_message_id"] if part == 0 else sent[0]["message_id"], json.loads(markups[part]), entities[part])
+                self.store.save_feedback(job["id"], part, message_id, text, markups[part], encoded_entities[part])
                 self.store.defer_feedback(job["id"], time.time() + 2)
-                self.chat_ready[user] = time.time() + 1.2
+                self.chat_ready[user] = time.time() + 1.05
                 # Each chunk has a persistent ID, so retrying a long response reuses delivered parts.
                 if job["status"] in ("done", "failed") and part == len(desired) - 1:
                     self.store.feedback_complete(job["id"], job["response"])
+                    if job.get("callback_id"):
+                        log.info("callback_delivered job=%s total_ms=%d", job["id"], (time.time()-job["created"])*1000)
             except TelegramError as exc:
                 log.warning("feedback job=%s error=%s", job["id"], str(exc))
                 if str(exc) == "TELEGRAM_403":

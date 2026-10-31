@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 
@@ -11,6 +12,8 @@ class Store:
     LOCK_ID = 5570758412811194196
 
     def __init__(self, settings, *, worker=False):
+        self.work_ready = asyncio.Event()
+        self.feedback_ready = asyncio.Event()
         self.db = psycopg.connect(**settings.database(), autocommit=True, row_factory=dict_row)
         try:
             self.db.execute(SCHEMA)
@@ -58,6 +61,9 @@ class Store:
                     self.db.execute("INSERT INTO jobs(id,user_id,payload,created,source_message_id) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING",
                                     (uid, user, json.dumps(msg, ensure_ascii=False), time.time(), msg.get("message_id")))
                 self.db.execute("INSERT INTO meta VALUES('offset',%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value", (str(uid + 1),))
+        if updates:
+            self.work_ready.set()
+            self.feedback_ready.set()
 
     def next_job(self):
         # Per-user ordering preserves clarification context across retries.
@@ -67,14 +73,15 @@ class Store:
             AND NOT EXISTS(SELECT 1 FROM jobs older WHERE older.user_id=j.user_id AND older.id<j.id
                 AND older.status IN ('queued','processing')) ORDER BY id LIMIT 1""", (now, now - 2)).fetchone()
         if row:
-            self.db.execute("UPDATE jobs SET status='processing',attempts=attempts+1,progress=%s WHERE id=%s",
-                            ("Начинаю обработку", row["id"]))
+            self.db.execute("UPDATE jobs SET status='processing',attempts=attempts+1,progress=NULL WHERE id=%s", (row["id"],))
             return row
 
     def finish(self, job, response):
         markup = json.dumps(response.markup, ensure_ascii=False) if isinstance(response, Reply) else "{}"
         text = response.text if isinstance(response, Reply) else response
-        self.db.execute("UPDATE jobs SET status='done',response=%s,reply_markup=%s,payload='{}',error=NULL,notified=feedback_disabled,progress=NULL WHERE id=%s", (text, markup, job))
+        entities = json.dumps(response.entities) if isinstance(response, Reply) else '[]'
+        self.db.execute("UPDATE jobs SET status='done',response=%s,reply_markup=%s,reply_entities=%s,payload='{}',error=NULL,notified=feedback_disabled,progress=NULL,delivery_after=0 WHERE id=%s", (text, markup, entities, job))
+        self.feedback_ready.set()
 
     def ingest_callback(self, uid, callback, contacts, bot_id):
         sender, msg = callback.get("from", {}), callback.get("message", {})
@@ -102,7 +109,7 @@ class Store:
             # still finish in order, but an older dispatcher result cannot restore stale buttons.
             self.db.execute("""UPDATE jobs SET feedback_disabled=1,notified=1 WHERE user_id=%s AND id<>%s
                 AND id IN (SELECT job_id FROM job_feedback WHERE message_id=%s)""", (user, uid, msg["message_id"]))
-            self.save_feedback(uid, 0, msg["message_id"], previous["sent_text"], previous["sent_markup"])
+            self.save_feedback(uid, 0, msg["message_id"], previous["sent_text"], previous["sent_markup"], previous["sent_entities"])
 
     def pending_callbacks(self):
         return self.db.execute("SELECT id,user_id,callback_id FROM jobs WHERE callback_id IS NOT NULL AND callback_answered=0 ORDER BY created LIMIT 20").fetchall()
@@ -114,7 +121,7 @@ class Store:
         for record in self.db.execute("SELECT user_id,content FROM conversations WHERE updated>%s", (time.time()-86400,)).fetchall():
             user = record["user_id"]
             statement = json.loads(record["content"]).get("statement")
-            if user not in contacts or not statement or statement.get("ui_version") == 1:
+            if user not in contacts or not statement or statement.get("ui_version", 0) >= 1:
                 continue
             job = self.db.execute("""SELECT id,source_message_id FROM jobs WHERE user_id=%s AND status='done'
                 AND response LIKE %s AND NOT EXISTS(SELECT 1 FROM meta WHERE key='plan:' || jobs.id::text)
@@ -130,9 +137,30 @@ class Store:
     def fail(self, job, code, retry, response=None):
         self.db.execute("UPDATE jobs SET status=%s,error=%s,next_attempt=%s,response=%s,notified=feedback_disabled,progress=NULL WHERE id=%s",
                         ("queued" if retry else "failed", code, time.time() + 30, response, job))
+        self.feedback_ready.set()
+
+    def refresh_statement_menus(self, contacts):
+        for record in self.db.execute("SELECT user_id,content FROM conversations WHERE updated>%s", (time.time()-86400,)).fetchall():
+            user = record["user_id"]
+            statement = json.loads(record["content"]).get("statement")
+            if user not in contacts or not statement or not statement.get("ready") or statement.get("ui_version", 0) >= 2:
+                continue
+            job = self.db.execute("""SELECT id FROM jobs WHERE user_id=%s AND status='done' AND reply_markup LIKE %s
+                AND EXISTS(SELECT 1 FROM job_feedback WHERE job_id=jobs.id)
+                AND NOT EXISTS(SELECT 1 FROM meta WHERE key='plan:' || jobs.id::text) ORDER BY id DESC LIMIT 1""",
+                (user, '%s:' + statement['token'] + ':%')).fetchone()
+            if not job:
+                continue
+            with self.transaction():
+                statement["ui_version"] = 2
+                self.save_context(user, {"statement": statement})
+                self.db.execute("""UPDATE jobs SET status='queued',payload=%s,response=NULL,notified=0,
+                    feedback_disabled=0,next_attempt=0,attempts=0,progress=NULL,delivery_after=0 WHERE id=%s""",
+                    (json.dumps({"_refresh_statement_ui": statement["token"]}), job["id"]))
 
     def progress(self, job, text):
         self.db.execute("UPDATE jobs SET progress=%s WHERE id=%s AND status='processing'", (text[:500], job))
+        self.feedback_ready.set()
 
     def active_queue(self):
         now = time.time()
@@ -155,8 +183,11 @@ class Store:
     def feedback_messages(self, job):
         return {row["part"]: dict(row) for row in self.db.execute("SELECT * FROM job_feedback WHERE job_id=%s", (job,))}
 
-    def save_feedback(self, job, part, message_id, text, markup="{}"):
-        self.db.execute("INSERT INTO job_feedback(job_id,part,message_id,sent_text,sent_markup) VALUES(%s,%s,%s,%s,%s) ON CONFLICT(job_id,part) DO UPDATE SET message_id=EXCLUDED.message_id,sent_text=EXCLUDED.sent_text,sent_markup=EXCLUDED.sent_markup", (job, part, message_id, text, markup))
+    def save_feedback(self, job, part, message_id, text, markup="{}", entities="[]"):
+        self.db.execute("INSERT INTO job_feedback(job_id,part,message_id,sent_text,sent_markup,sent_entities) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(job_id,part) DO UPDATE SET message_id=EXCLUDED.message_id,sent_text=EXCLUDED.sent_text,sent_markup=EXCLUDED.sent_markup,sent_entities=EXCLUDED.sent_entities", (job, part, message_id, text, markup, entities))
+
+    def has_feedback(self):
+        return self.db.execute("SELECT EXISTS(SELECT 1 FROM jobs WHERE feedback_disabled=0 AND notified=0) AS pending").fetchone()["pending"]
 
     def defer_feedback(self, job, until):
         self.db.execute("UPDATE jobs SET delivery_after=%s WHERE id=%s", (until, job))
@@ -177,6 +208,8 @@ class Store:
     def retry_job(self, user, job):
         self.db.execute("""UPDATE jobs SET status='queued',attempts=0,next_attempt=0,progress=NULL,response=NULL,
             reply_markup='{}',notified=0,feedback_disabled=0,delivery_after=0 WHERE id=%s AND user_id=%s AND status='failed'""", (job, user))
+        self.work_ready.set()
+        self.feedback_ready.set()
         return True
 
     def notified(self, job):
@@ -257,5 +290,7 @@ CREATE INDEX IF NOT EXISTS jobs_feedback_due ON jobs(delivery_after,id) WHERE no
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reply_markup TEXT NOT NULL DEFAULT '{}';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS callback_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS callback_answered INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reply_entities TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE job_feedback ADD COLUMN IF NOT EXISTS sent_entities TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE job_feedback ADD COLUMN IF NOT EXISTS sent_markup TEXT NOT NULL DEFAULT '{}';
 """

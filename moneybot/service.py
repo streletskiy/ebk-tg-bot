@@ -102,6 +102,7 @@ class Service:
             raise RuntimeError("Existing webhook detected; remove explicitly before polling")
         await self.codex.start()
         self.store.resume_statements(self.s.contacts)
+        self.store.refresh_statement_menus(self.s.contacts)
         log.info("started bot=%s contacts=%s", me["username"], len(self.s.contacts))
         tasks = [asyncio.create_task(self.poll()), asyncio.create_task(self.worker()),
                  asyncio.create_task(self.deliver()), asyncio.create_task(self.maintenance())]
@@ -174,15 +175,20 @@ class Service:
 
     async def worker(self):
         while not self.stopping.is_set():
+            self.store.work_ready.clear()
             self.store.set_meta("worker_heartbeat", time.time())
             job = self.store.next_job()
             if not job:
-                await asyncio.sleep(1)
+                try:
+                    await asyncio.wait_for(self.store.work_ready.wait(), 1 if self.store.active_queue() else 30)
+                except TimeoutError:
+                    pass
                 continue
             if job["user_id"] not in self.s.contacts:
                 self.store.finish(job["id"], "")
                 self.store.notified(job["id"])
                 continue
+            started = time.perf_counter()
             try:
                 response = await self.handle(job)
                 self.store.finish(job["id"], response)
@@ -202,6 +208,9 @@ class Service:
                 log.error("job=%s error_type=%s", job["id"], type(exc).__name__)
                 self.store.fail(job["id"], type(exc).__name__, False,
                     "Обработка остановлена. Проверьте /status; после устранения причины — /retry.")
+            finally:
+                if job.get("callback_id"):
+                    log.info("callback_handled job=%s duration_ms=%d", job["id"], (time.perf_counter()-started)*1000)
 
     async def handle(self, job):
         def progress(text):
@@ -228,6 +237,17 @@ class Service:
             if not statement or statement["token"] != message["_resume_statement"]:
                 return "Этот импорт уже закрыт."
             return await self.statement_ui.start(job, statement)
+        if "_refresh_statement_ui" in message:
+            statement = (self.store.context(user) or {}).get("statement")
+            if not statement or statement["token"] != message["_refresh_statement_ui"]:
+                return "Этот импорт уже закрыт."
+            catalog = await self.ez.catalog()
+            self.imports.cache_catalog(statement, catalog)
+            await self.imports.suggest_categories(job, statement, catalog)
+            self.imports.save(user, statement)
+            if statement.get("ui_row"):
+                return self.statement_ui.row_view(statement, statement["rows"][statement["ui_row"]-1], catalog)
+            return self.statement_ui.view(statement)
         if text.startswith("/"):
             progress("Выполняю команду")
             if text.split()[0].split("@")[0].lower() in (
@@ -404,8 +424,13 @@ class Service:
 
     async def deliver(self):
         while True:
+            self.store.feedback_ready.clear()
             changed = await self.feedback.tick()
-            await asyncio.sleep(0.25 if changed else 0.5)
+            delay = (0.1 if changed else 0.25) if self.store.has_feedback() else 30
+            try:
+                await asyncio.wait_for(self.store.feedback_ready.wait(), delay)
+            except TimeoutError:
+                pass
 
     async def maintenance(self):
         while True:

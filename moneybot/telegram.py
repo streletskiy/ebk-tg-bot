@@ -1,5 +1,5 @@
 from pathlib import PurePosixPath
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -8,6 +8,29 @@ import httpx
 class Reply:
     text: str
     markup: dict
+    entities: list = field(default_factory=list)
+
+
+def card_reply(sections, keyboard):
+    """Style trusted section boundaries, never interpret merchant/model text as markup."""
+    text = "\n\n".join(s for s in sections if s)
+    entities, offset = [], 0
+    for section in text.split("\n\n"):
+        heading = section.split("\n", 1)[0]
+        entities.append({"type": "bold", "offset": offset, "length": len(heading.encode("utf-16-le")) // 2})
+        offset += len((section + "\n\n").encode("utf-16-le")) // 2
+    return Reply(text, {"inline_keyboard": keyboard}, entities)
+
+
+def chunk_entities(entities, chunks):
+    result, offset = [], 0
+    for text in chunks:
+        length = len(text.encode("utf-16-le")) // 2
+        result.append([{**e, "offset": max(e["offset"], offset) - offset,
+                        "length": min(e["offset"] + e["length"], offset + length) - max(e["offset"], offset)}
+                       for e in entities if e["offset"] < offset + length and e["offset"] + e["length"] > offset])
+        offset += length
+    return result
 
 
 def button(text, data=None, style=None):
@@ -47,7 +70,7 @@ def message_chunks(text, limit=3500):
         if end < len(text) and "\n" in chunk and chunk.rsplit("\n", 1)[0]:
             chunk = chunk.rsplit("\n", 1)[0]
         chunks.append(chunk)
-        text = text[len(chunk):].lstrip("\n")
+        text = text[len(chunk):]
     return chunks
 
 
@@ -79,8 +102,10 @@ class Telegram:
         for chunk in message_chunks(text):
             await self.send_text(user, chunk)
 
-    async def send_text(self, user, text, source_message_id=None, markup=None):
+    async def send_text(self, user, text, source_message_id=None, markup=None, entities=None):
         payload = {"chat_id": user, "text": text, "link_preview_options": {"is_disabled": True}}
+        if entities:
+            payload["entities"] = entities
         if source_message_id:
             payload["reply_parameters"] = {"message_id": source_message_id, "allow_sending_without_reply": True}
         if markup:
@@ -88,10 +113,11 @@ class Telegram:
         result = await self.markup_call("sendMessage", payload)
         return result["message_id"]
 
-    async def edit_text(self, user, message_id, text, markup=None):
+    async def edit_text(self, user, message_id, text, markup=None, entities=None):
         try:
             await self.markup_call("editMessageText", {"chat_id": user, "message_id": message_id, "text": text,
-                            "link_preview_options": {"is_disabled": True}, "reply_markup": markup or {"inline_keyboard": []}})
+                            "link_preview_options": {"is_disabled": True}, "entities": entities or [],
+                            "reply_markup": markup or {"inline_keyboard": []}})
         except TelegramError as exc:
             if not exc.not_modified:
                 raise
