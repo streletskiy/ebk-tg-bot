@@ -4,6 +4,7 @@ import logging
 import hashlib
 import hmac
 import time
+from collections import defaultdict
 from datetime import datetime
 
 from pydantic import ValidationError
@@ -15,8 +16,8 @@ from .imports import StatementImports
 from .import_ui import StatementUI
 from .media import Media
 from .memory import active_rules, apply_changes
-from .models import Decision, money
-from .payments import confirmation_only, normalize_payment_time, payment_fingerprints
+from .models import Decision, ImagePaymentReview, money
+from .payments import confirmation_only, normalize_payment_time, payment_fingerprints, validate_image_coverage
 from .replies import clarification_reply
 from .store import Store
 from .telegram import Telegram, TelegramError
@@ -33,7 +34,10 @@ action=record для сообщения о совершённом расходе
 если пользователь не просит только проверить/обсудить его без записи. Явное «не записывай» приоритетнее.
 Это относится и к скриншоту из банковского приложения без подписи: не нужны «запиши», «да» или «подтверждаю».
 Несколько скриншотов завершённых платежей — просьба записать все различимые операции, а не спросить разрешение
-на всю пачку. Не объединяй разные платежи в одну сумму. Один и тот же платёж на двух изображениях не повторяй.
+на всю пачку. Не объединяй разные платежи в одну сумму.
+На одном скриншоте списка может быть несколько покупок у одного продавца: каждая строка — отдельная операция,
+даже при одинаковом названии или сумме. Прочитай весь список сверху вниз, включая нижние строки.
+Не удаляй предполагаемые дубли из плана, в том числе между изображениями: их сверяет приложение с книгой.
 Если нет явных признаков плана, условия, цитаты или вопроса о расходах, считай описание траты уже совершённой
 операцией. Отсутствие глагола в прошедшем времени не является неоднозначностью.
 Не спрашивай «Записать/добавить?» или «Уже потратили или только планируете?» для таких сообщений.
@@ -63,6 +67,7 @@ occurred_at — ISO 8601 с часовым поясом. Если дата не 
 Не уточняй счёт, валюту, дату или время только потому, что они не названы: используй подходящие значения
 по умолчанию. Не проси подтверждения перед record, если сумма, тип, счёт, валюта, категория и дата определены.
 Сохраняй информацию о магазине/покупке в description. Не включай номера карт, персональные данные чека.
+В merchant скопируй видимое название продавца без слов «оплата», «покупка» и деталей покупки; не выдумывай его.
 source_image — номер изображения (начиная с 1), откуда взята операция; 0 для текста/голосового без изображения.
 time_precision: second/minute, только если время видно/явно названо; day, если видна лишь дата;
 unknown, если нет ни даты, ни времени. Не выдавай придуманное 12:00 или now за явно показанное время.
@@ -371,8 +376,15 @@ class Service:
                 account = next(a for a in catalog["accounts"] if a["id"] == entry.account_id)
                 category = next(c for c in catalog["categories"] if c["id"] == entry.category_id)
                 payload["comment"] += "".join(f"\n[moneybot:payment:{key}]" for key in fingerprints[index])
+                reference = fingerprints[index][-1] if entry.source_image and len(fingerprints[index]) > 1 else ""
+                if reference:
+                    payload["comment"] += f"\n[moneybot:reference:{reference}]"
                 plan.append({"marker": marker, "payload": payload, "currency": entry.currency,
                              "fingerprints": fingerprints[index],
+                             "payment": {"source_image": entry.source_image,
+                                         "time_precision": entry.time_precision,
+                                         "reference": reference,
+                                         "merchant": entry.merchant or entry.description} if entry.source_image else None,
                              "account": account["name"], "category": category["name"]})
             with self.store.transaction():
                 memory_response = apply_changes(self.store, user, decision.memory_changes, catalog, source)
@@ -421,6 +433,26 @@ class Service:
             decision = Decision.model_validate(await self.codex.generate(prompt, Decision.model_json_schema(), instructions, images))
             if decision.action == "clarify" and confirmation_only(decision.message):
                 raise CodexError("CODEX_CONFIRMATION_INSTEAD_OF_PLAN")
+        if images and decision.action in ("record", "clarify", "ignore"):
+            instructions = INSTRUCTIONS + "\nНезависимо перечитай ВСЕ строки ВСЕХ исходных изображений сверху вниз. " \
+                "Сначала составь visible_payments, затем исправь decision по этому полному перечню. " \
+                "Не считай одну покупку на продавца: две отдельные строки — две операции. " \
+                "Сохраняй кратность одинаковых названий и сумм. Не исключай возможные дубли с книгой. " \
+                "Учитывай явные ограничения пользователя: если он просит учесть только часть строк, " \
+                "перечисли только её; если просит ничего не записывать, не возвращай record. " \
+                "Итог одного кассового чека не путай со списком независимых банковских операций."
+            review = ImagePaymentReview.model_validate(await self.codex.generate(
+                prompt, ImagePaymentReview.model_json_schema(), instructions, images))
+            decision = review.decision
+            if decision.action == "record":
+                if len(review.visible_payments) > 10:
+                    raise UserInputError("На изображениях больше 10 платежей. Разделите список на несколько сообщений.")
+                try:
+                    validate_image_coverage(decision.entries, review.visible_payments, len(images))
+                except ValueError as exc:
+                    raise CodexError("CODEX_PAYMENT_COVERAGE_MISMATCH") from exc
+            elif decision.action == "clarify" and confirmation_only(decision.message):
+                raise CodexError("CODEX_CONFIRMATION_INSTEAD_OF_PLAN")
         return decision
 
     async def apply_plan(self, job, plan):
@@ -433,6 +465,7 @@ class Service:
         lines = []
         updated = 0
         duplicates = 0
+        used_payment_ids = defaultdict(set)
         for index, item in enumerate(plan, 1):
             self.s.reload_contacts()
             if job["user_id"] not in self.s.contacts:
@@ -445,8 +478,13 @@ class Service:
                 await self.ez.update_time_once(item["marker"], job["id"], item["before"], item["after"])
                 updated += 1
                 continue
+            payment = item.get("payment")
+            used_ids = used_payment_ids[payment["source_image"]] if payment else set()
             result = await self.ez.create_once(item["marker"], job["id"], payload,
-                                               fingerprints=item.get("fingerprints", ()))
+                                               fingerprints=item.get("fingerprints", ()),
+                                               payment=payment, used_ids=used_ids)
+            if result.get("id"):
+                used_ids.add(str(result["id"]))
             duplicate = bool(result.get("_moneybot_duplicate"))
             duplicates += duplicate
             kind = "Расход" if payload["type"] == 3 else "Доход"

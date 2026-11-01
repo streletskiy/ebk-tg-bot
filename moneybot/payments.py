@@ -10,6 +10,32 @@ from pathlib import Path
 from .models import cents, local_datetime
 
 
+def validate_image_coverage(entries, visible, image_count):
+    def identity(row):
+        if not 1 <= row.source_image <= image_count:
+            raise ValueError("Invalid payment image index")
+        return row.source_image, row.kind, cents(row.amount), row.currency.upper()
+
+    expected = Counter(identity(row) for row in visible)
+    actual = Counter(identity(row) for row in entries if row.source_image)
+    if expected != actual:
+        raise ValueError("Image payment inventory does not match the plan")
+
+
+def same_merchant(merchant, comment):
+    def words(value):
+        value = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
+        return re.findall(r"[^\W_]+", value, re.UNICODE)
+
+    merchant = words(merchant)
+    description = words(comment.split("\n[moneybot:", 1)[0])
+    if len("".join(merchant)) < 4:
+        return False
+    # Only a complete name/phrase matches; a shared generic word is insufficient.
+    return any(description[i:i + len(merchant)] == merchant
+               for i in range(len(description) - len(merchant) + 1))
+
+
 def confirmation_only(question):
     text = " ".join(question.casefold().split())
     if re.search(r"\b(?:како\w*|какую|какая|когда|сколько|куда)\b", text):

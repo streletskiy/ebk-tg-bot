@@ -20,6 +20,8 @@ class Entry(StrictModel):
 
 
 class PaymentEntry(Entry):
+    merchant: str = Field(max_length=180, description=(
+        "Merchant/payee name visible in the source, without purchase details; empty if unknown."))
     source_image: int = Field(ge=0, le=5, description="1-based source image index; 0 for text or voice")
     time_precision: Literal["second", "minute", "day", "unknown"] = Field(
         description="Precision visible in the source; day/unknown when an image does not show a time")
@@ -60,6 +62,21 @@ class Decision(StrictModel):
             "For clarify with 2 or 3 short answers, provide every answer as a button label, including Yes/No. "
             "For open-ended questions or other actions return []. Free text is always accepted."))
     memory_changes: list[MemoryChange] = Field(max_length=10)
+
+
+class VisiblePayment(StrictModel):
+    source_image: int = Field(ge=1, le=5)
+    kind: Literal["expense", "income"]
+    amount: str
+    currency: str
+
+
+class ImagePaymentReview(StrictModel):
+    visible_payments: list[VisiblePayment] = Field(max_length=100, description=(
+        "Inventory of every requested completed purchase/income row, top to bottom in each image. "
+        "Keep separate rows even with identical merchants and amounts. Exclude transfers and pending payments. "
+        "One receipt total is one payment; its item lines are not payments."))
+    decision: Decision
 
 
 def cents(value: str) -> int:

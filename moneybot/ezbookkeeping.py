@@ -2,6 +2,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 import httpx
 
 from .models import cents, local_datetime, money
+from .payments import same_merchant
 
 
 class EzError(Exception):
@@ -156,7 +158,10 @@ class EzBookkeeping:
                 if not previous:
                     raise UncertainWrite("EZ_PAYMENT_IDENTITY_UNCERTAIN")
                 if previous["state"] == "done":
-                    return json.loads(previous["result"] or '{}'), previous_marker
+                    result = json.loads(previous["result"] or '{}')
+                    if not result.get("id"):
+                        result = await self.reconcile(previous_marker, payload)
+                    return result, previous_marker
                 return await self.reconcile(previous_marker, json.loads(previous["payload"])), previous_marker
             tag = f"[moneybot:payment:{fingerprint}]"
             rows = await self.call("transactions/list/all.json", params={
@@ -169,13 +174,49 @@ class EzBookkeeping:
                 return matches[0], ""
         return None
 
-    async def create_once(self, marker, job_id, payload, *, fingerprints=()):
+    async def matching_payment(self, payload, payment, used_ids):
+        day = datetime.fromtimestamp(payload["time"], self.s.timezone).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        rows = await self.statement_history(payload["sourceAccountId"], int(day.timestamp()),
+                                            int((day + timedelta(days=1)).timestamp()) - 1)
+        matches = []
+        for row in rows:
+            references = re.findall(r"\[moneybot:reference:([a-f0-9]{64})\]", row.get("comment", ""))
+            if not references:
+                legacy = re.findall(r"\[moneybot:payment:([a-f0-9]{64})\]", row.get("comment", ""))
+                references = legacy[1:]
+            if payment.get("reference") and references and payment["reference"] not in references:
+                continue
+            account = row.get("sourceAccountId") or row.get("sourceAccount", {})
+            account = account.get("id") if isinstance(account, dict) else account
+            if (str(row.get("id", "")) in used_ids or not row.get("id")
+                    or str(account) != payload["sourceAccountId"]
+                    or row.get("type") != payload["type"] or row.get("sourceAmount") != payload["sourceAmount"]
+                    or datetime.fromtimestamp(row["time"], self.s.timezone).date() != day.date()
+                    or not same_merchant(payment["merchant"], row.get("comment", ""))):
+                continue
+            if payment["time_precision"] in ("second", "minute"):
+                existing = datetime.fromtimestamp(row["time"], self.s.timezone)
+                # Older screenshots without a time were recorded at noon. They still need deduplication.
+                if existing.time().isoformat() != "12:00:00" and row["time"] // 60 != payload["time"] // 60:
+                    continue
+            matches.append(row)
+        return sorted(matches, key=lambda row: (row["time"], str(row["id"])))
+
+    async def create_once(self, marker, job_id, payload, *, fingerprints=(), payment=None, used_ids=()):
         previous = self.store.write(marker)
         if previous:
             if previous["state"] == "done":
-                return json.loads(previous["result"] or '{}')
+                result = json.loads(previous["result"] or '{}')
+                if payment and not result.get("id"):
+                    result = await self.reconcile(marker, payload)
+                return result
             return await self.reconcile(marker, json.loads(previous["payload"]))
         duplicate = await self.payment_duplicate(payload, fingerprints) if fingerprints else None
+        if duplicate is None and payment and payment.get("merchant"):
+            matches = await self.matching_payment(payload, payment, used_ids)
+            if matches:
+                duplicate = matches[0], ""
         if duplicate is not None:
             result, previous_marker = duplicate
             result = {**result, "_moneybot_duplicate": True}
