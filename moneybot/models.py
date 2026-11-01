@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -55,6 +55,10 @@ class Decision(StrictModel):
     entries: list[PaymentEntry] = Field(max_length=10)
     query: Query | None
     message: str = Field(max_length=3000)
+    reply_options: list[Annotated[str, Field(min_length=1, max_length=48)]] = Field(
+        max_length=3, description=(
+            "For clarify with 2 or 3 short answers, provide every answer as a button label, including Yes/No. "
+            "For open-ended questions or other actions return []. Free text is always accepted."))
     memory_changes: list[MemoryChange] = Field(max_length=10)
 
 

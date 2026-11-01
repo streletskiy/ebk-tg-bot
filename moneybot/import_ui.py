@@ -1,5 +1,6 @@
 """Persistent, private-chat controls for bank imports (Telegram Bot API 10.3)."""
 
+import re
 import secrets
 from collections import Counter
 from datetime import datetime
@@ -277,6 +278,26 @@ class StatementUI:
 
     async def text(self, job, text):
         statement = self.engine.current(job["user_id"])
+        answer = " ".join(re.sub(r"[^\w\s]", "", text.casefold()).split())
+        if answer in ("нет", "не надо", "не записывай", "отмена", "отменить", "no", "cancel"):
+            return await self.callback(job, f"s:{statement['token']}:cancel:")
+        if (statement.get("ready") and not statement.get("ui_row")
+                and answer in ("да", "да конечно", "конечно", "ага", "угу", "ок", "окей", "хорошо",
+                               "подтверждаю", "подтвердить", "записывай", "запиши", "yes", "ok")):
+            return await self.callback(job, f"s:{statement['token']}:confirm:")
+        catalog = statement.get("ui_catalog")
+        if catalog and text.strip():
+            if not statement.get("account_id"):
+                matches = [a for a in catalog["accounts"] if a["name"].casefold() == text.strip().casefold()]
+                if len(matches) == 1:
+                    return await self.callback(job, f"s:{statement['token']}:account:{matches[0]['id']}")
+            elif statement.get("ui_row"):
+                row = statement["rows"][statement["ui_row"]-1]
+                matches = [c for c in catalog["categories"] if c["name"].casefold() == text.strip().casefold()
+                           and str(c.get("parentId", "0")) != "0"
+                           and c.get("type") == (2 if row["kind"] == "expense" else 1)]
+                if len(matches) == 1:
+                    return await self.callback(job, f"s:{statement['token']}:category:{row['number']},{matches[0]['id']}")
         if statement.get("ui_row") and text.strip():
             row = statement["rows"][statement["ui_row"]-1]
             if not row.get("blocked"):

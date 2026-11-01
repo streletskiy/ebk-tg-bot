@@ -350,16 +350,19 @@ class EzBookkeeping:
         heading = f"{start:%d.%m.%Y} — {(end-timedelta(seconds=1)):%d.%m.%Y} ({self.s.timezone})"
         if not relevant:
             return heading + "\nЗаписей по запросу нет."
-        lines = [heading]
+        lines = [heading, ""]
         for currency, values in sorted(totals.items()):
-            lines.append(f"{currency}: доходы {money(values[2])}; расходы {money(values[3])}; разница {money(values[2]-values[3])}.")
+            lines.append(f"Итоги · {currency}\nДоходы: {money(values[2])} {currency}\n"
+                         f"Расходы: {money(values[3])} {currency}\n"
+                         f"Разница: {money(values[2]-values[3])} {currency}\n")
         lines.append(f"Операций: {len(relevant)}. Переводы и корректировки баланса не включены.")
         for (currency, kind), amounts in sorted(statistics.items()):
             from decimal import Decimal, ROUND_HALF_UP
             average = int((Decimal(sum(amounts)) / len(amounts)).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
-            lines.append(f"{'Расходы' if kind == 3 else 'Доходы'} {currency}: {len(amounts)} записей, среднее {money(average)}, минимум {money(min(amounts))}, максимум {money(max(amounts))}.")
+            lines.append(f"\n{'Расходы' if kind == 3 else 'Доходы'} · {currency}\nЗаписей: {len(amounts)}\n"
+                         f"Среднее: {money(average)} · минимум: {money(min(amounts))} · максимум: {money(max(amounts))}")
         if query.view == "transactions":
-            lines.append("Последние записи (до 30):")
+            lines.append("\nПоследние записи (до 30):")
             for row, currency, name in relevant[:30]:
                 dt = datetime.fromtimestamp(row["time"], self.s.timezone)
                 comment = row.get("comment", "").split("\n[moneybot:", 1)[0][:140]
@@ -367,7 +370,7 @@ class EzBookkeeping:
                 lines.append(f"{dt:%d.%m}: {sign}{money(row['sourceAmount'])} {currency} · {name} · {comment}")
         else:
             labels = {"category": "По категориям", "month": "По месяцам", "day": "По дням", "account": "По счетам", "merchant": "По описаниям (магазины не нормализованы)"}
-            lines.append(labels[query.group_by] + ":")
+            lines.append("\n" + labels[query.group_by] + ":")
             ordered = sorted(by_category.items(), key=(lambda pair: pair[0]) if query.group_by in ("month", "day") else (lambda pair: -pair[1]))
             for (currency, kind, name), amount in ordered[:30]:
                 lines.append(f"{'−' if kind == 3 else '+'} {name}: {money(amount)} {currency}")

@@ -4,6 +4,7 @@ import json
 import time
 
 from .telegram import TelegramError, chunk_entities, message_chunks
+from .replies import styled_reply
 
 log = logging.getLogger("moneybot")
 
@@ -72,7 +73,9 @@ class Feedback:
             desired = self.desired(job, queue)
             if not desired and job["status"] not in ("done", "failed"):
                 continue
-            entities = chunk_entities(json.loads(job.get("reply_entities") or '[]') if job["status"] == "done" else [], desired)
+            full_entities = (json.loads(job.get("reply_entities") or '[]') if job["status"] == "done"
+                             else styled_reply("".join(desired)).entities)
+            entities = chunk_entities(full_entities, desired)
             encoded_entities = [json.dumps(e, sort_keys=True) for e in entities]
             markup = json.loads(job.get("reply_markup") or '{}') if job["status"] == "done" else {}
             if job["status"] == "failed":

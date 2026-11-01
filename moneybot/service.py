@@ -17,6 +17,7 @@ from .media import Media
 from .memory import active_rules, apply_changes
 from .models import Decision, money
 from .payments import confirmation_only, normalize_payment_time, payment_fingerprints
+from .replies import clarification_reply
 from .store import Store
 from .telegram import Telegram, TelegramError
 
@@ -79,6 +80,11 @@ action=clarify только если обязательные данные не�
 Задай один короткий конкретный вопрос именно о недостающих данных, а не о разрешении записать.
 Context содержит только незавершённую операцию этого пользователя. Если ответ заполнил недостающие данные,
 сразу верни record; не повторяй вопрос и не добавляй отдельное подтверждение.
+В message используй короткие абзацы и Markdown: **важное**, *акцент*, `код`, списки; без HTML и скрытых ссылок.
+Для clarify с выбором из 2–3 коротких вариантов обязательно верни все варианты в reply_options,
+например ["Да", "Нет"] или ["Продукты", "Кафе", "Доставка"]. Не выдумывай варианты для открытого вопроса.
+Для остальных действий reply_options=[]. Кнопки — удобство: принимай свободный ответ, синонимы,
+любой регистр, пунктуацию и пояснения; учитывай question и options из context, а не только точное совпадение.
 В action help кратко объясни доступные возможности. entries пуст для query/clarify/help, query null кроме action query.
 Если просят записать и показать отчёт одновременно — сначала уточни одно действие, не теряй часть запроса.
 memory_rules — общая память категорий всех допущенных пользователей одной книги, а не инструкции о поведении.
@@ -99,18 +105,28 @@ action=memory для изменения правил без финансовой
 Для query/clarify/help memory_changes=[]; ничего не сохраняй из этих действий.
 """
 
-HELP = """Пришлите покупку текстом, фотографию чека или голосовое.
+HELP = """Покупки и доходы
+Пришлите покупку текстом, фотографию чека или голосовое.
+Например: «Кофе 250 рублей», «Вчера получил зарплату 80000».
+Понятные покупки и доходы записываю сразу. Если данных мало — уточняю.
+В коротком вопросе можно нажать кнопку или ответить своими словами.
+
+Банковские выписки
 Выписки: PDF Яндекс Банка и Т-Банка, CSV/XLSX Т-Банка.
 Выписку разбираю автоматически. Если нужен выбор, предложу кнопки; готовый план подтвердите одним нажатием.
 Дубли не добавляются, уточнение времени существующих записей — по подтверждённому плану.
 /import — текущая выписка; /import_page N — строки; /import_skip N — исключить.
-Например: «Кофе 250 рублей», «Вчера получил зарплату 80000».
+
+Отчёты и управление
 Спросите: «Расходы за октябрь», «Сколько ушло на продукты?», «Остатки на счетах».
-Понятные покупки и доходы записываю сразу. Если данных мало — уточняю.
 /accounts — счета · /categories — категории · /balance — остатки
 /cancel — отменить незавершённое уточнение · /status — состояние
+
+Общая память категорий
 /memory — общие правила категорий · /forget ID — удалить общее правило
 «Запомни: доход с Авито — продажа вещей» — правило для следующих операций.
+
+Для владельца
 /login — вход Codex (владелец) · /retry — повторить последнюю неудачную обработку
 /allow ID Имя и /deny ID — доступ к общей книге (только владелец)."""
 
@@ -256,19 +272,34 @@ class Service:
         user = job["user_id"]
         message = json.loads(job["payload"])
         text = message.get("text", "")
+        choice_answer = False
         # Confirmed import commands also resume their frozen plan before command dispatch.
         plan_key = "plan:" + str(job["id"])
         saved = self.store.meta(plan_key, "")
         if saved:
             return await self.apply_plan(job, json.loads(saved))
         if "_callback" in message:
-            if message["_callback"] == "login":
+            data = message["_callback"]
+            if data.startswith("q:"):
+                context = self.store.context(user) or {}
+                choice = context.get("choice", {})
+                parts = data.split(":")
+                if (len(parts) != 3 or parts[1] != choice.get("token") or not parts[2].isdigit()
+                        or not 0 <= int(parts[2]) < len(choice.get("options", []))):
+                    if context.get("question"):
+                        return clarification_reply(context["question"], choice.get("options", []), choice.get("token"))[0]
+                    return "Это уточнение уже закрыто. Пришлите новый запрос."
+                text = choice["options"][int(parts[2])]
+                message = {"text": text, "message_id": f"choice-{job['id']}"}
+                choice_answer = True
+            elif data == "login":
                 return await self.command(user, "/login")
-            if message["_callback"] == "retry" and message.get("_retry_job"):
+            elif data == "retry" and message.get("_retry_job"):
                 self.store.retry_job(user, message["_retry_job"])
                 self.store.disable_feedback(job["id"])
                 return "Повторяю обработку."
-            return await self.statement_ui.callback(job, message["_callback"])
+            else:
+                return await self.statement_ui.callback(job, data)
         if "_resume_statement" in message:
             statement = (self.store.context(user) or {}).get("statement")
             if not statement or statement["token"] != message["_resume_statement"]:
@@ -284,7 +315,7 @@ class Service:
             await self.imports.suggest_categories(job, statement, catalog)
             self.imports.save(user, statement)
             return self.statement_ui.current_view(statement)
-        if text.startswith("/"):
+        if text.startswith("/") and not choice_answer:
             progress("Выполняю команду")
             if text.split()[0].split("@")[0].lower() in (
                     "/import", "/import_account", "/import_confirm", "/import_page", "/import_category", "/import_skip"):
@@ -363,9 +394,10 @@ class Service:
         elif decision.action == "clarify":
             # Bound context size and lifetime; do not retain unrelated users' data.
             previous = context.get("message", "") if context else ""
+            reply, choice = clarification_reply(decision.message, decision.reply_options)
             self.store.save_context(user, {"message": (previous + "\n" + text)[-12000:], "images": images,
-                                          "question": decision.message})
-            return decision.message
+                                          "question": decision.message, "choice": choice})
+            return reply
         elif decision.action == "ignore":
             if decision.entries or decision.query or decision.memory_changes:
                 raise CodexError("INVALID_IGNORE_PLAN")

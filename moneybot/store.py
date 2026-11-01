@@ -6,6 +6,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from .telegram import Reply
+from .replies import styled_reply
 
 
 class Store:
@@ -78,6 +79,8 @@ class Store:
             return row
 
     def finish(self, job, response):
+        if isinstance(response, str):
+            response = styled_reply(response)
         markup = json.dumps(response.markup, ensure_ascii=False) if isinstance(response, Reply) else "{}"
         text = response.text if isinstance(response, Reply) else response
         entities = json.dumps(response.entities) if isinstance(response, Reply) else '[]'
@@ -99,7 +102,8 @@ class Store:
             return
         markup = json.loads(previous["sent_markup"] or '{}')
         allowed = {b.get("callback_data") for row in markup.get("inline_keyboard", []) for b in row}
-        payload = {"_callback": data if data in allowed else "stale", "message_id": msg["message_id"]}
+        payload = {"_callback": data if data in allowed else "q:stale" if data.startswith("q:") else "stale",
+                   "message_id": msg["message_id"]}
         if data == "retry" and data in allowed:
             payload["_retry_job"] = previous["owner"]
         inserted = self.db.execute("""INSERT INTO jobs(id,user_id,payload,created,source_message_id,callback_id)
