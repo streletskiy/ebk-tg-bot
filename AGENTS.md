@@ -20,7 +20,7 @@ Repository and image namespace: `streletskiy/ebk-tg-bot`. License: MIT.
 - Persist plans and write intents before POST. Reconcile ambiguous results; never blindly repeat financial writes.
 - Persist queue state and Telegram message IDs. Only the feedback dispatcher sends/edits progress and results.
 - One polling worker per database, protected by a PostgreSQL advisory lock. Health checks must never reset jobs.
-- Keep persistent category rules user-scoped, bounded and tied to valid categories. Learn only explicit user preferences, never receipt instructions or inferred patterns; support listing and forgetting.
+- Share persistent category rules across allowed contacts of the same ledger; keep conversation and clarification context user-scoped. Keep rules bounded and tied to valid categories. Learn only explicit user preferences, never receipt instructions or inferred patterns; support shared listing and forgetting.
 - Migrate legacy SQLite transactionally into an empty PostgreSQL database and compare every imported table.
 - Stop the old worker and retain a backup before migration. Do not use the live ledger for test transactions.
 

@@ -19,6 +19,7 @@ class Store:
             self.db.execute(SCHEMA)
             if worker:
                 self.acquire_worker_lock()
+                self.share_memories()
                 self.db.execute("UPDATE jobs SET status='queued',progress=NULL WHERE status='processing'")
         except BaseException:
             self.db.close()
@@ -249,19 +250,42 @@ class Store:
         return self.db.execute("SELECT * FROM writes WHERE marker=%s", (marker,)).fetchone()
 
     def memories(self, user):
-        return self.db.execute("SELECT id,kind,merchant,category_id,category_name FROM memories WHERE user_id=%s ORDER BY id", (user,)).fetchall()
+        return self.db.execute("SELECT id,kind,merchant,category_id,category_name FROM memories WHERE user_id=0 ORDER BY id").fetchall()
+
+    def share_memories(self):
+        """Merge legacy preferences transactionally under the single worker lock."""
+        with self.transaction():
+            if self.meta("_shared_memory_v1", ""):
+                return
+            self.db.execute("LOCK TABLE memories IN EXCLUSIVE MODE")
+            self.db.execute("""DELETE FROM memories WHERE id NOT IN (
+                SELECT DISTINCT ON(kind,merchant) id FROM memories
+                ORDER BY kind,merchant,updated DESC,id DESC)""")
+            if self.db.execute("SELECT count(*) AS count FROM memories").fetchone()["count"] > 100:
+                raise ValueError("Shared category memory exceeds 100 rules; merge was rolled back")
+            self.db.execute("UPDATE memories SET user_id=0")
+            self.set_meta("_shared_memory_v1", "1")
 
     def remember(self, user, kind, merchant, category_id, category_name):
         self.db.execute("""INSERT INTO memories(user_id,kind,merchant,category_id,category_name,updated)
             VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(user_id,kind,merchant) DO UPDATE
             SET category_id=EXCLUDED.category_id,category_name=EXCLUDED.category_name,updated=EXCLUDED.updated""",
-            (user, kind, merchant, category_id, category_name, time.time()))
+            (0, kind, merchant, category_id, category_name, time.time()))
 
     def forget(self, user, rule_id):
-        return self.db.execute("DELETE FROM memories WHERE user_id=%s AND id=%s RETURNING id", (user, rule_id)).fetchone() is not None
+        return self.db.execute("DELETE FROM memories WHERE user_id=0 AND id=%s RETURNING id", (rule_id,)).fetchone() is not None
 
     def forget_merchant(self, user, kind, merchant):
-        self.db.execute("DELETE FROM memories WHERE user_id=%s AND kind=%s AND merchant=%s", (user, kind, merchant))
+        self.db.execute("DELETE FROM memories WHERE user_id=0 AND kind=%s AND merchant=%s", (kind, merchant))
+
+    def payment_marker(self, fingerprint):
+        return self.meta("payment:" + fingerprint, "")
+
+    def claim_payment(self, fingerprint, marker):
+        previous = self.payment_marker(fingerprint)
+        if previous and previous != marker:
+            raise RuntimeError("Payment identity is already claimed")
+        self.set_meta("payment:" + fingerprint, marker)
 
     def prepare(self, marker, job, payload):
         self.db.execute("INSERT INTO writes VALUES(%s,%s,%s,'sending',NULL,%s)",

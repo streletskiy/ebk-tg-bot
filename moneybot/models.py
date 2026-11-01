@@ -19,6 +19,15 @@ class Entry(StrictModel):
     description: str = Field(max_length=180)
 
 
+class PaymentEntry(Entry):
+    source_image: int = Field(ge=0, le=5, description="1-based source image index; 0 for text or voice")
+    time_precision: Literal["second", "minute", "day", "unknown"] = Field(
+        description="Precision visible in the source; day/unknown when an image does not show a time")
+    payment_reference: str = Field(max_length=160, description=(
+        "Unique bank transaction/reference ID copied from the payment, otherwise empty. "
+        "Never a card number, phone, account number, short authorization code or invented identifier."))
+
+
 class Query(StrictModel):
     start: str
     end: str
@@ -39,8 +48,11 @@ class MemoryChange(StrictModel):
 
 
 class Decision(StrictModel):
-    action: Literal["record", "query", "clarify", "help", "memory"]
-    entries: list[Entry] = Field(max_length=10)
+    action: Literal["record", "query", "clarify", "help", "memory", "ignore"] = Field(description=(
+        "Completed payment screenshots, receipts and descriptions of expenses mean record by default. "
+        "Clarify only missing essential data; never ask permission to record. "
+        "Ignore transfers unless the user explicitly asks about them; exclude them from mixed payment lists."))
+    entries: list[PaymentEntry] = Field(max_length=10)
     query: Query | None
     message: str = Field(max_length=3000)
     memory_changes: list[MemoryChange] = Field(max_length=10)

@@ -1,4 +1,4 @@
-"""Bounded, user-scoped category preferences; never arbitrary model instructions."""
+"""Bounded category preferences shared by ledger contacts; never model instructions."""
 
 import re
 import unicodedata

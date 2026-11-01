@@ -148,14 +148,49 @@ class EzBookkeeping:
             return result
         raise UncertainWrite("EZ_WRITE_UNCERTAIN")
 
-    async def create_once(self, marker, job_id, payload):
+    async def payment_duplicate(self, payload, fingerprints):
+        for fingerprint in fingerprints:
+            previous_marker = self.store.payment_marker(fingerprint)
+            if previous_marker:
+                previous = self.store.write(previous_marker)
+                if not previous:
+                    raise UncertainWrite("EZ_PAYMENT_IDENTITY_UNCERTAIN")
+                if previous["state"] == "done":
+                    return json.loads(previous["result"] or '{}'), previous_marker
+                return await self.reconcile(previous_marker, json.loads(previous["payload"])), previous_marker
+            tag = f"[moneybot:payment:{fingerprint}]"
+            rows = await self.call("transactions/list/all.json", params={
+                "keyword": tag, "start_time": payload["time"] - 86400,
+                "end_time": payload["time"] + 86400, "trim_account": "true", "trim_category": "true"})
+            matches = [r for r in rows if tag in r.get("comment", "")]
+            if matches:
+                if len(matches) != 1 or matches[0].get("sourceAmount") != payload["sourceAmount"] or matches[0].get("type") != payload["type"]:
+                    raise UncertainWrite("EZ_PAYMENT_IDENTITY_UNCERTAIN")
+                return matches[0], ""
+        return None
+
+    async def create_once(self, marker, job_id, payload, *, fingerprints=()):
         previous = self.store.write(marker)
         if previous:
             if previous["state"] == "done":
                 return json.loads(previous["result"] or '{}')
             return await self.reconcile(marker, json.loads(previous["payload"]))
+        duplicate = await self.payment_duplicate(payload, fingerprints) if fingerprints else None
+        if duplicate is not None:
+            result, previous_marker = duplicate
+            result = {**result, "_moneybot_duplicate": True}
+            with self.store.transaction():
+                self.store.prepare(marker, job_id, payload)
+                for fingerprint in fingerprints:
+                    if not self.store.payment_marker(fingerprint):
+                        self.store.claim_payment(fingerprint, previous_marker or marker)
+                self.store.write_result(marker, result)
+            return result
         # Commit the intent BEFORE network I/O. An ambiguous POST is never automatically repeated.
-        self.store.prepare(marker, job_id, payload)
+        with self.store.transaction():
+            self.store.prepare(marker, job_id, payload)
+            for fingerprint in fingerprints:
+                self.store.claim_payment(fingerprint, marker)
         try:
             result = await self.call("transactions/add.json", body=payload)
         except EzError:
