@@ -10,6 +10,15 @@ from pathlib import Path
 from .models import cents, local_datetime
 
 
+CYRILLIC_TRANSLITERATION = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
+
+
 def validate_image_coverage(entries, visible, image_count):
     def identity(row):
         if not 1 <= row.source_image <= image_count:
@@ -24,7 +33,8 @@ def validate_image_coverage(entries, visible, image_count):
 
 def same_merchant(merchant, comment):
     def words(value):
-        value = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
+        # Ledger comments and bank screenshots may spell the same name in different scripts.
+        value = unicodedata.normalize("NFKC", value).casefold().translate(CYRILLIC_TRANSLITERATION)
         return re.findall(r"[^\W_]+", value, re.UNICODE)
 
     merchant = words(merchant)
