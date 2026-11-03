@@ -52,7 +52,8 @@ action=ignore, entries=[], query=null, memory_changes=[]. Не спрашива�
 пользователя, что конкретный перевод — оплата совершённой покупки/услуги, позволяет учесть его как расход.
 Не изменяй и не удаляй существующие записи.
 Один чек — одна запись на итоговую сумму, включая скидки; не суммируй повторно строки, НДС и итог.
-Несколько явно отдельных покупок допустимы, до 10 записей. Не повторяй уже завершённые операции.
+Несколько явно отдельных покупок допустимы, до 10 записей. Даже если платёж выглядит уже учтённым,
+включи его в record: приложение сверит его с книгой и сообщит, если запись уже существует.
 В amount строка десятичного числа без разделителей тысяч, например 1234.50. Валюта ISO 4217.
 Сумма должна быть явно указана в сообщении/чеке/речи. Если не уверен в сумме — clarify.
 Выбирай только реальные ID из каталога. Category type 1 = доход, 2 = расход.
@@ -444,6 +445,8 @@ class Service:
             review = ImagePaymentReview.model_validate(await self.codex.generate(
                 prompt, ImagePaymentReview.model_json_schema(), instructions, images))
             decision = review.decision
+            if decision.action == "ignore" and review.visible_payments:
+                raise CodexError("CODEX_PAYMENT_COVERAGE_MISMATCH")
             if decision.action == "record":
                 if len(review.visible_payments) > 10:
                     raise UserInputError("На изображениях больше 10 платежей. Разделите список на несколько сообщений.")
@@ -489,12 +492,24 @@ class Service:
             duplicates += duplicate
             kind = "Расход" if payload["type"] == 3 else "Доход"
             description = payload["comment"].split("\n[moneybot:", 1)[0]
-            lines.append(f"{'Уже учтено · ' if duplicate else ''}{kind}: {money(payload['sourceAmount'])} {item['currency']}\n{description}\nСчёт: {item['account']} · {item['category']}\nЗапись: {result.get('id', 'учтена ранее' if duplicate else 'сохранена')}")
+            line = f"{kind}: {money(payload['sourceAmount'])} {item['currency']}\n{description}"
+            if duplicate:
+                line += "\nОперация уже есть в ezBookkeeping. Повторно не добавлена."
+            else:
+                line += f"\nСчёт: {item['account']} · {item['category']}"
+            if result.get("id"):
+                line += f"\nЗапись: {result['id']}"
+            elif not duplicate:
+                line += "\nЗапись: сохранена"
+            lines.append(line)
         if statement:
             return (f"Импорт завершён. Добавлено: {len(plan) - updated}; уточнено время: {updated}.\n"
                     "Категории, комментарии и вложения существующих записей сохранены.\n"
                     "Проверьте результат в ezBookkeeping или запросите отчёт в боте.")
-        heading = "Повторных записей не создано:" if duplicates == len(plan) else "Записано в ezBookkeeping:"
+        if duplicates:
+            heading = f"Добавлено: {len(plan) - duplicates}. Уже было в ezBookkeeping: {duplicates}."
+        else:
+            heading = "Записано в ezBookkeeping:"
         return heading + "\n\n" + "\n\n".join(lines) + ("\n\n" + memory_response if memory_response else "")
 
     async def command(self, user, text):
