@@ -31,19 +31,22 @@ def validate_image_coverage(entries, visible, image_count):
         raise ValueError("Image payment inventory does not match the plan")
 
 
-def same_merchant(merchant, comment):
-    def words(value):
-        # Ledger comments and bank screenshots may spell the same name in different scripts.
-        value = unicodedata.normalize("NFKC", value).casefold().translate(CYRILLIC_TRANSLITERATION)
-        return re.findall(r"[^\W_]+", value, re.UNICODE)
+def merchant_words(value):
+    # Ledger comments and bank screenshots may spell the same name in different scripts.
+    value = unicodedata.normalize("NFKC", value).casefold().translate(CYRILLIC_TRANSLITERATION)
+    return re.findall(r"[^\W_]+", value, re.UNICODE)
 
-    merchant = words(merchant)
-    description = words(comment.split("\n[moneybot:", 1)[0])
-    if len("".join(merchant)) < 4:
-        return False
+
+def has_merchant_words(description, merchant):
     # Only a complete name/phrase matches; a shared generic word is insufficient.
-    return any(description[i:i + len(merchant)] == merchant
+    return bool(merchant) and any(description[i:i + len(merchant)] == merchant
                for i in range(len(description) - len(merchant) + 1))
+
+
+def same_merchant(merchant, comment):
+    words = merchant_words(merchant)
+    description = merchant_words(comment.split("\n[moneybot:", 1)[0])
+    return len("".join(words)) >= 4 and has_merchant_words(description, words)
 
 
 def confirmation_only(question):

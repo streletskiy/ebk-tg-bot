@@ -30,15 +30,36 @@ class PaymentEntry(Entry):
         "Never a card number, phone, account number, short authorization code or invented identifier."))
 
 
-class Query(StrictModel):
+class ReportPeriod(StrictModel):
     start: str
     end: str
+
+
+class ReportMatch(StrictModel):
+    label: str = Field(min_length=1, max_length=80)
+    terms: list[Annotated[str, Field(min_length=1, max_length=80)]] = Field(min_length=1, max_length=5)
+
+
+ReportGroup = Literal["category", "category_family", "year", "month", "week", "day", "account", "merchant"]
+ReportMetric = Literal["total", "count", "average", "minimum", "maximum"]
+
+
+class Query(ReportPeriod):
     kind: Literal["all", "expense", "income"]
     account_ids: list[str]
     category_ids: list[str]
-    keyword: str
+    exclude_category_ids: list[str]
+    currency: str
+    matches: list[ReportMatch] = Field(max_length=12)
+    min_amount: str
+    max_amount: str
     view: Literal["summary", "transactions", "balances"]
-    group_by: Literal["category", "month", "day", "account", "merchant"]
+    group_by: ReportGroup | None
+    then_by: ReportGroup | None
+    metrics: list[ReportMetric] = Field(max_length=5)
+    order: Literal["default", "largest", "smallest", "oldest", "newest"]
+    limit: Annotated[int, Field(ge=1, le=30)] | None
+    compare_with: list[ReportPeriod] = Field(max_length=3)
 
 
 class MemoryChange(StrictModel):

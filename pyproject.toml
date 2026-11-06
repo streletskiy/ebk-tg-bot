@@ -1,6 +1,6 @@
 [project]
 name = "ebk-tg-bot"
-version = "0.7.2"
+version = "0.8.0"
 license = "MIT"
 description = "Private Telegram bookkeeping assistant with Codex OAuth and ezBookkeeping"
 requires-python = ">=3.12"

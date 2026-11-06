@@ -76,16 +76,37 @@ unknown, если нет ни даты, ни времени. Не выдавай
 payment_reference — только дословный уникальный банковский ID операции/референс, иначе пустая строка.
 Не используй для него номер карты/телефона/счёта, короткий код авторизации или обычный номер кассового чека.
 Дубли приложение сверяет само перед записью. Возможность дубля сама по себе не повод спрашивать «Записать?».
-Для query выбирай view summary (итоги и категории), transactions (история/поиск) или balances (остатки).
-group_by: category по умолчанию; month/day для сравнения периодов, account по счетам, merchant по описаниям.
-Период start включительно, end исключительно, ISO 8601. «В этом месяце» — календарный месяц в переданном часовом поясе.
-Если период не назван, текущий месяц. Фильтр keyword только при поиске продавца/текста, не дублируй категорию ключевым словом.
-Не придумывай цифры отчёта: приложение само получит и посчитает данные.
+Для вопросов о записанных доходах и расходах выбирай action=query: приложение читает книгу и считает отчёт.
+Используй view summary для суммы, количества, среднего, минимума и максимума, transactions для списка операций,
+balances для текущих остатков. «Сколько потратили» — expense и total; «сколько покупок» — expense и count.
+Период start включительно, end исключительно, ISO 8601 в часовом поясе now. Указанный последний день включай целиком.
+«В этом месяце» — текущий календарный месяц; если период не назван и это новый запрос, тоже текущий месяц.
+Для «сравни этот месяц с прошлым» помести текущий месяц в start/end, предыдущий — в compare_with.
+Для сравнения с таким же числом прошедших дней выбери сопоставимые границы, когда это просит пользователь.
+Для нескольких названных категорий/счетов укажи все подходящие ID. Для целого раздела или группы счетов перечисли
+все подходящие дочерние ID из каталога, для исключений заполни exclude_category_ids. Не дублируй категории в matches.
+Для продавцов или текста в описании укажи matches: отдельный объект на каждый магазин/фразу, label — понятное имя,
+terms — узнаваемые написания или алиасы этого же магазина. Между объектами и вариантами действует «или»:
+«Сколько ушло в Самокате, СПАРе и Скуратове» — три объекта, например Самокат с ["Самокат", "Samokat"],
+SPAR с ["SPAR", "EUROSPAR"], Скуратов с ["Скуратов", "Skuratov"]. Не соединяй магазины в одну поисковую фразу,
+не заменяй их категорией «Продукты» и не добавляй слишком общие слова вроде «магазин» или «кофе».
+Для итога по списку магазинов используй group_by=merchant, чтобы показать общий итог и вклад каждого магазина.
+Для разбивки по категориям используй category, по их разделам — category_family, по счетам — account,
+для динамики — day/week/month/year. Можно добавить вторую ось then_by, например month и category.
+Если нужен только общий итог, group_by=null и then_by=null. Для общего обзора расходов группируй по категориям.
+currency заполняй только при явном ограничении. min_amount/max_amount — границы суммы одной операции,
+не итоговой суммы; отсутствие ограничения — пустая строка. «Три крупнейшие покупки» — view=transactions,
+order=largest, limit=3; «три самые затратные категории» — view=summary, group_by=category, order=largest, limit=3.
+Для незаданных параметров используй пустые строки/списки, null для then_by и limit, order=default.
+previous_report — последний успешный план отчёта этого пользователя. Для «а за прошлый месяц?», «а без доставки?»
+или «покажи их списком» сохрани все подходящие фильтры и измени только запрошенное. Для нового вопроса используй
+его собственные условия. Сообщение о новой совершённой покупке по-прежнему означает record.
+Не придумывай цифры отчёта, не отказывай в расчёте из-за нескольких магазинов, категорий или периодов.
 action=clarify только если обязательные данные нельзя определить из сообщения/чека, context, memory_rules
 и подходящих значений по умолчанию, либо есть реальное противоречие, влияющее на запись.
 Задай один короткий конкретный вопрос именно о недостающих данных, а не о разрешении записать.
-Context содержит только незавершённую операцию этого пользователя. Если ответ заполнил недостающие данные,
-сразу верни record; не повторяй вопрос и не добавляй отдельное подтверждение.
+context содержит незавершённое уточнение этого пользователя. Если ответ заполнил недостающие данные,
+верни подходящий план record или query. Не повторяй вопрос и не добавляй отдельное подтверждение.
 В message используй короткие абзацы и Markdown: **важное**, *акцент*, `код`, списки; без HTML и скрытых ссылок.
 Для clarify с выбором из 2–3 коротких вариантов обязательно верни все варианты в reply_options,
 например ["Да", "Нет"] или ["Продукты", "Кафе", "Доставка"]. Не выдумывай варианты для открытого вопроса.
@@ -124,7 +145,8 @@ HELP = """Покупки и доходы
 /import — текущая выписка; /import_page N — строки; /import_skip N — исключить.
 
 Отчёты и управление
-Спросите: «Расходы за октябрь», «Сколько ушло на продукты?», «Остатки на счетах».
+Спросите: «Сколько ушло на кафе и доставку?», «Сколько потратили в Самокате и SPAR?».
+Можно сравнить месяцы, найти крупнейшие покупки или уточнить «А за прошлый месяц?».
 /accounts — счета · /categories — категории · /balance — остатки
 /cancel — отменить незавершённое уточнение · /status — состояние
 
@@ -348,7 +370,9 @@ class Service:
         prompt = json.dumps({"now": datetime.now(self.s.timezone).isoformat(),
             "default_account_id": contact.account or self.s.default_account,
             "default_currency": contact.currency, "catalog": self.ez.model_catalog(catalog),
-            "context": context, "memory_rules": active_rules(self.store, user, catalog), "message": text,
+            "context": {k: v for k, v in context.items() if k != "report"} if context and context.get("question") else None,
+            "previous_report": context.get("report") if context else None,
+            "memory_rules": active_rules(self.store, user, catalog), "message": text,
             "input_kind": "image" if images else "voice" if message.get("voice") or message.get("audio") else "text",
             "ledger_policy": "shared_category_memory; completed_payments_record_by_default; application_checks_duplicates"}, ensure_ascii=False)
         progress("Разбираю изображение чека" if images else "Определяю покупку, доход или запрос отчёта")
@@ -402,14 +426,17 @@ class Service:
                 self.store.set_meta(plan_key, json.dumps({"entries": [], "memory_response": response}, ensure_ascii=False))
                 self.store.save_context(user, None)
         elif decision.action == "query":
+            if decision.entries or decision.memory_changes:
+                raise CodexError("INVALID_QUERY_PLAN")
             response = await self.ez.report(decision.query, catalog, progress=progress)
-            self.store.save_context(user, None)
+            self.store.save_context(user, {"report": decision.query.model_dump()})
         elif decision.action == "clarify":
             # Bound context size and lifetime; do not retain unrelated users' data.
             previous = context.get("message", "") if context else ""
             reply, choice = clarification_reply(decision.message, decision.reply_options)
             self.store.save_context(user, {"message": (previous + "\n" + text)[-12000:], "images": images,
-                                          "question": decision.message, "choice": choice})
+                                          "question": decision.message, "choice": choice,
+                                          "report": context.get("report") if context else None})
             return reply
         elif decision.action == "ignore":
             if decision.entries or decision.query or decision.memory_changes:
